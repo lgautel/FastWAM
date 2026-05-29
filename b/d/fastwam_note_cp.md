@@ -17,6 +17,7 @@
 8. [讨论与局限](#8-讨论与局限)
 9. [参考文献](#9-参考文献)
 10. [训练数据格式与处理流水线](#10-训练数据格式与处理流水线)
+11. [论文内容与本地实现对照](#11-论文内容与本地实现对照)
 
 ---
 
@@ -956,6 +957,406 @@ def build_datasets(data_cfg: DictConfig):
 4. **模型**：`build_inputs` VAE 编码视频 latent，proprio 注入文本条件，与 flow matching 联合训练。
 
 理解该流水线后，可快速定位「形状不对 / 缓存缺失 / pad 掩码异常」等问题，并能有针对性地改 yaml 或增广策略。
+
+---
+
+## 11. 论文内容与本地实现对照
+
+本章对照 [FastWAM.pdf](./FastWAM.pdf)（[arXiv:2603.16666](https://arxiv.org/abs/2603.16666)）、[项目主页](https://yuantianyuan01.github.io/FastWAM/) 与 [官方 GitHub](https://github.com/yuantianyuan01/FastWAM)，说明**本地仓库实现了论文的哪些部分、如何调用、关键逻辑在哪、缺什么以及对效果的影响**。第 3–10 章已分别讲方法、数据与实验；此处侧重 **paper ↔ code 映射**。
+
+### 11.1 总览：论文主张 vs 仓库覆盖度
+
+论文核心主张可概括为：
+
+1. **训练**：保留视频 co-training（\(\mathcal{L}_{\mathrm{vid}}\)）塑造世界表征 \(z(o,\ell)\)；
+2. **推理**：不显式去噪未来视频，直接 \(p_\theta(a_{1:H}\mid z(o,\ell))\)（Eq.3–4）；
+3. **对照**：Joint / IDM 复现 imagine-then-execute；去掉 co-train 作消融。
+
+#### 覆盖度总表
+
+| 论文 / 官网内容 | 本地状态 | 主要实现位置 |
+|-----------------|----------|--------------|
+| MoT + Wan2.2-5B 视频 DiT + 1B ActionDiT | **已实现** | `FastWAM`, `MoT`, `WanVideoDiT`, `ActionDiT` |
+| 结构化注意力（action 仅看首帧 video） | **已实现** | `FastWAM._build_mot_attention_mask` |
+| 联合 Flow Matching \(\mathcal{L}=\mathcal{L}_{\mathrm{act}}+\lambda\mathcal{L}_{\mathrm{vid}}\) | **已实现** | `training_loss`, `WanContinuousFlowMatchScheduler` |
+| 快速推理 `infer_action` + video KV cache | **已实现** | `prefill_video_cache`, `forward_action_with_video_cache` |
+| Fast-WAM-Joint（范式 A） | **已实现** | `FastWAMJoint` + `task=*_joint_*` |
+| Fast-WAM-IDM（范式 B） | **已实现** | `FastWAMIDM` + `task=*_idm_*` |
+| w.o. video co-train 消融 | **需手动配置** | 无专用 task；设 `loss.lambda_video: 0` |
+| LIBERO / RoboTwin 仿真评测 | **已实现** | `experiments/libero/`, `experiments/robotwin/` |
+| 真机折毛巾 + 190ms 延迟 | **未开源** | 仅论文 / 项目页报告 |
+| 外层长程「视频自回归 rollout」 | **论文省略** | 部署用 action chunk + replan |
+| Embodied 预训练 | **未做**（论文设定） | 从 Wan2.2 初始化，无机器人 PT 管线 |
+
+#### 模块映射（Mermaid）
+
+```mermaid
+flowchart LR
+  subgraph paper [论文模块]
+    P1[MoT架构]
+    P2[注意力掩码]
+    P3[FlowMatching训练]
+    P4[infer_action]
+    P5[Joint_IDM变体]
+    P6[仿真Benchmark]
+    P7[真机与测速]
+  end
+
+  subgraph code [本地代码]
+    C1[src/fastwam/models/wan22]
+    C2[configs/model]
+    C3[configs/task x6]
+    C4[experiments]
+    C5[缺失]
+  end
+
+  P1 --> C1
+  P2 --> C1
+  P3 --> C1
+  P4 --> C1
+  P5 --> C1
+  P5 --> C3
+  P6 --> C4
+  P7 --> C5
+```
+
+---
+
+### 11.2 已实现：核心方法如何落地
+
+#### 11.2.1 训练路径：调用关系与数据流
+
+**入口链**：
+
+```text
+scripts/train.py  @hydra.main(train.yaml + task=...)
+  → runtime.run_training(cfg)
+      → instantiate(cfg.model)     # create_fastwam | joint | idm
+      → build_datasets(cfg.data)   # RobotVideoDataset
+      → Wan22Trainer.train()
+```
+
+```mermaid
+sequenceDiagram
+  participant Train as scripts/train.py
+  participant RT as runtime.run_training
+  participant Hydra as Hydra instantiate
+  participant DS as RobotVideoDataset
+  participant M as FastWAM
+  participant T as Wan22Trainer
+
+  Train->>RT: DictConfig
+  RT->>Hydra: cfg.model
+  Hydra->>M: create_fastwam_from_wan22
+  RT->>Hydra: cfg.data.train
+  Hydra->>DS: RobotVideoDataset
+  RT->>T: model train_ds val_ds
+  loop each_train_step
+    T->>DS: DataLoader batch
+    DS-->>T: video action context pads
+    T->>M: training_loss sample
+    M->>M: build_inputs VAE_encode
+    M->>M: add_noise MoT forward
+    M-->>T: loss_total loss_dict
+    T->>T: backward AdamW ZeRO1
+  end
+```
+
+**损失与论文公式对应**（Sec.3.2 Eq.5–9）：
+
+$$
+y_t = (1-t)y + t\epsilon, \quad
+\mathcal{L}_{\mathrm{FM}}(y) = \mathbb{E}\|f_\theta(y_t,t,o,\ell) - (\epsilon - y)\|^2
+$$
+
+\[
+$$\mathcal{L} = \mathcal{L}_{\mathrm{act}} + \lambda \mathcal{L}_{\mathrm{vid}}$$
+\]
+
+代码中 `training_loss`（`fastwam.py`）对 `input_latents` 与 `action` 分别 `sample_training_t` → `add_noise` → MoT → MSE，并用 `training_weight(t)` 加权：
+
+```563:567:src/fastwam/models/wan22/fastwam.py
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+```
+
+\($\lambda$\) 来自 `runtime.create_fastwam` 的 `loss.lambda_video` / `lambda_action`（默认均为 1.0，`configs/model/fastwam.yaml` 仅显式写 `lambda_action`）。
+
+**实现差异（训练噪声时间 \(t\)）**：论文写 Following Wan2.2 采用 **logit-normal** 分布；本地 `WanContinuousFlowMatchScheduler.sample_training_t` 使用 \($u \sim \mathrm{Uniform}(0,1)$\) 再经 \($\phi(u,\mathrm{shift})$\) 映射到 \($\sigma$\)（`scheduler_continuous.py` L31–37）。这是与 Wan 官方实现路线一致的常见写法，对收敛影响通常次要，但严格复现论文文字时需知此差别。
+
+**可训练参数**：`Wan22Trainer` 冻结 VAE /（训练时不加载）T5，仅优化 `model.dit`（即 MoT）与可选 `proprio_encoder`（`trainer.py` L84–93）。
+
+#### 11.2.2 部署推理路径（论文主结论）
+
+论文推理因子分解：
+
+\[
+$$p_\theta(a_{1:H} \mid o, \ell) \approx p_\theta(a_{1:H} \mid z(o,\ell)), \quad
+z \text{ 由首帧 latent 单次前向得到，非积分 } \int p(v_{1:T})\,\mathrm{d}v$$
+\]
+
+**仿真部署默认走 `infer_action`**，而非 `infer` / `infer_joint`：
+
+| 场景 | 调用 API | 文件 |
+|------|----------|------|
+| LIBERO 闭环 | `model.infer_action(**kwargs)` | `experiments/libero/eval_libero_single.py` L418 |
+| RoboTwin 策略 | `self.model.infer_action(...)` | `experiments/robotwin/fastwam_policy/deploy_policy.py` L259 |
+| 训练期 val 监控 | `model.infer(...)` → **`infer_joint`** | `trainer.py` L422 |
+
+```mermaid
+flowchart TB
+  subgraph infer_action_path [infer_action 部署路径]
+    O[当前多相机图像] --> VAE[VAE encode 首帧]
+    VAE --> Pre[video_expert.pre_dit t=0]
+    Pre --> Cache[mot.prefill_video_cache]
+    Cache --> Loop[动作 flow matching N 步]
+    Loop --> AOut[反归一化 action chunk]
+  end
+
+  subgraph infer_joint_path [infer_joint 想象路径]
+    O2[首帧图像] --> JV[初始化未来 video+action latent]
+    JV --> JLoop[每步 _predict_joint_noise 同步更新]
+    JLoop --> Both[解码 video 与 action]
+  end
+```
+
+`infer_action` 核心步骤（与论文 Figure 1(C) 一致）：
+
+1. `first_frame_latents`，`timestep_video = 0`；
+2. `mot.prefill_video_cache`：30 层缓存 video K/V，**不迭代未来视频去噪**；
+3. 仅对 `latents_action` 循环 `forward_action_with_video_cache` + `scheduler.step`。
+
+```1013:1022:src/fastwam/models/wan22/fastwam.py
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            ...
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+```
+
+#### 11.2.3 MoT 与三种掩码逻辑
+
+**MoT**（`mot.py`）：每层将 video / action 专家的 Q、K、V 在序列维 `cat`，一次 `flash_attention`（带 mask），再各自 cross-attn(T5 context) + FFN。训练时 `mot.forward`；推理动作用 `forward_action_with_video_cache` 复用缓存的 video K/V。
+
+| 变体类 | action → video 可见性 | 训练序列 | 推理默认 |
+|--------|----------------------|----------|----------|
+| `FastWAM` | **仅首帧** token | noisy 未来帧 + action | `infer_action` |
+| `FastWAMJoint` | **全部** video token | 同左 | `infer_joint`（Joint 覆盖 `infer_action` 为 joint 循环） |
+| `FastWAMIDM` | action → **cond** 支路 only | `[noisy \| cond \| action]`，`video_cond_noise_prob=0.5` | `infer_joint` 类路径 |
+
+Fast-WAM 掩码构建（论文 Figure 2b）：
+
+```396:407:src/fastwam/models/wan22/fastwam.py
+        mask[:video_seq_len, :video_seq_len] = self.video_expert.build_video_to_video_mask(...)
+        mask[video_seq_len:, video_seq_len:] = True
+        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+        mask[video_seq_len:, :first_frame_tokens] = True
+```
+
+Joint 唯一改动：
+
+```47:48:src/fastwam/models/wan22/fastwam_joint.py
+        mask[video_seq_len:, :video_seq_len] = True
+```
+
+#### 11.2.4 仓库模块依赖图
+
+```mermaid
+flowchart TB
+  subgraph scripts [scripts]
+    train_py[train.py]
+    pre_t5[precompute_text_embeds.py]
+    pre_adit[preprocess_action_dit_backbone.py]
+  end
+
+  subgraph runtime [fastwam/runtime.py]
+    create_fw[create_fastwam]
+    create_joint[create_fastwam_joint]
+    create_idm[create_fastwam_idm]
+    build_ds[build_datasets]
+    run_train[run_training]
+  end
+
+  subgraph datasets [datasets/lerobot]
+    RVD[RobotVideoDataset]
+    FWP[FastWAMProcessor]
+    BLD[BaseLerobotDataset]
+  end
+
+  subgraph models [models/wan22]
+    FW[FastWAM]
+    MOT[MoT]
+    WDiT[WanVideoDiT]
+    ADiT[ActionDiT]
+    Sched[scheduler_continuous]
+  end
+
+  subgraph eval [experiments]
+    libero[eval_libero_single]
+    deploy[deploy_policy]
+  end
+
+  train_py --> run_train
+  run_train --> create_fw
+  run_train --> build_ds
+  build_ds --> RVD
+  RVD --> BLD
+  BLD --> FWP
+  create_fw --> FW
+  FW --> MOT
+  MOT --> WDiT
+  MOT --> ADiT
+  FW --> Sched
+  pre_t5 -.->|T5 cache| RVD
+  pre_adit -.->|ActionDiT ckpt| ADiT
+  libero --> FW
+  deploy --> FW
+```
+
+---
+
+### 11.3 已实现：实验与工程配套
+
+与论文 Sec.4 及 [GitHub README](https://github.com/yuantianyuan01/FastWAM) 对齐的部分：
+
+| 论文实验设定 | 本地实现 |
+|--------------|----------|
+| Wan2.2-5B + Action expert 1024-d，约 6B | `configs/model/fastwam.yaml`；`preprocess_action_dit_backbone.py` |
+| 动作 horizon \(H=32\)，视频 9 帧（4× 下采样） | `num_frames: 33`, `action_video_freq_ratio: 4`（第 10 章） |
+| LIBERO 四 suite、20k steps | 数据路径 + `task=libero_*`；步数由 `num_epochs`×数据集大小决定，可设 `max_steps=20000` |
+| RoboTwin multi-task、30k steps | `task=robotwin_*`；README 提及 64 卡加速，本地 `train_zero1.sh` 支持多机 |
+| AdamW \(10^{-4}\), wd 0.01, cosine, bf16, clip 1.0 | `configs/task/*.yaml` 中 `weight_decay: 1e-2`；`train.yaml` + task 覆盖 lr |
+| 推理 10 steps, CFG=1.0 | `eval_num_inference_steps: 10`；`sim_*.yaml` 中 `text_cfg_scale: 1.0` |
+| unseen 指令（对齐 Motus） | `EVALUATION.instruction_type: unseen`（RoboTwin）；LIBERO 用任务文本 |
+| 发布 checkpoint | Hugging Face `yuanty/fastwam` |
+
+**评测闭环（非论文外层视频 AR）**：环境每 `replan_steps` 步重新调用策略；`action_horizon=32` 的 chunk 只执行前 `replan_steps` 步（`deploy_policy.py`）。这与论文「单 chunk、省略外层 AR」的 controlled comparison **一致**。
+
+**可选：可视化未来视频**：`EVALUATION.visualize_future_video=true` 时走 `infer_joint`（`eval_libero_single.py` L414–415），用于调试/可视化，**不是** 默认部署路径。
+
+**辅助但未论文主线的代码**：
+
+- `Wan22Core` + `runtime.run_inference`：单图 → `model.infer` 存 MP4，偏视频生成 demo；
+- `create_wan22_model`：纯视频 Wan，无 MoT/动作。
+
+---
+
+### 11.4 部分实现或与论文/官网不一致
+
+| 项目 | 论文 / 官网 | 本地现状 | 对算法效果的影响 |
+|------|-------------|----------|------------------|
+| 训练 val 视频 rollout | 需监控生成质量 | `evaluate()` 调 **`infer` → `infer_joint`** | **不影响** 部署 `infer_action` 策略；wandb 上 PSNR/SSIM 反映「想象路径」，与 190ms 延迟无关 |
+| `infer()` 命名 | 对外应 direct policy | `infer()` **硬编码转发** `infer_joint`（L1070） | 脚本若误用 `infer()` 会极慢、且行为像 Motus 式联合去噪；评测已规避 |
+| `infer()` 默认 `text_cfg_scale` | 论文推理 CFG=1.0 | 函数默认 **5.0**；sim 显式传 1.0 | 按官方 eval 配置**无影响**；自定义脚本需注意 |
+| 训练 \(t\) 采样 | logit-normal 表述 | Uniform + shift 映射 | 通常**影响很小** |
+| 优化器 `betas` | 论文未写死 | `(0.9, 0.95)` | 次要超参 |
+| `mot_checkpoint_mixed_attn` | 论文未强调 | LIBERO/RoboTwin task 设为 **`false`** | 省显存、略增计算；不改变方法定义 |
+| `action_conditioned` | 部分 WAM 在 video cross-attn 拼 action | 代码支持，**yaml 均为 false** | 与 Fast-WAM 正文一致 |
+| 训练步数 | LIBERO 20k / RoboTwin 30k | task 用 `num_epochs`，无内置 20k/30k | 需自行设 `max_steps` 或算 epoch，否则**复现表格数值**可能偏差 |
+
+---
+
+### 11.5 未实现项及对效果 / 复现的影响
+
+#### （1）真机折毛巾（Galaxea R1 Lite）
+
+- **缺失**：60h 遥操作数据、真机训练配置、R1 Lite 部署节点、成功率/完成时间评估脚本。
+- **能否补**：需自建数据与机器人接口；不在官方 repo 范围。
+- **影响**：无法验证项目页「真机 + 190ms」；**不影响** Table 1/2 仿真结论，因仿真管线完整。
+
+#### （2）w.o. video co-train 消融
+
+- **缺失**：无 `configs/task/*_no_video*.yaml`。
+- **能否补**：训练时覆盖，例如：
+
+```bash
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
+  model.loss.lambda_video=0
+```
+
+`runtime.create_fastwam` 会传入 `loss_lambda_video=0`（`runtime.py` L156），视频分支 loss 权重为零，但前向仍计算 video（若想完全不算 video 前向需改代码，论文消融仅去 **objective**）。
+
+- **影响**：**不跑则无法在本地验证论文最重要对照之一**（LIBERO 93.5% vs 97.6%，RoboTwin 83.8% vs 91.8%）——即「co-train 比 test-time imagination 更关键」。
+
+#### （3）延迟 benchmark（190 ms vs IDM 810 ms）
+
+- **缺失**：无官方 `benchmark_latency.py` 或 CI 测速。
+- **能否补**：对 `infer_action` / `infer_joint` 包 `torch.cuda.synchronize()` 计时；需与论文一致：单卡 RTX 5090D、10 steps、CFG=1.0。
+- **影响**：**不影响成功率**；仅影响「4× 加速」claim 的可复现性。IDM 慢主因是 test-time **完整 video denoise**，本地 `FastWAMIDM` 已实现该路径。
+
+#### （4）外层长程「生成更长未来视频」的自回归
+
+- **缺失**：无论文外的长视频 AR rollout。
+- **设计**：论文 Sec.3.3 明确只研究 **single action chunk**；长任务靠环境 **replan**（执行 `replan_steps` 后重新观测）。
+- **影响**：与论文 controlled setting **一致**；不是实现疏漏。
+
+#### （5）Embodied 预训练与第三方 WAM 训练
+
+- **缺失**：无 Motus / LingBot-VA / \(\pi_0\) 训练代码。
+- **影响**：论文对比的是**已发布 checkpoint**；本地只需仿真 eval + HF `fastwam` 权重。不影响 Fast-WAM 方法本身。
+
+#### （6）其它「看起来像缺失、实则一致」的项
+
+- **强视觉数据增广**：默认无（第 10 章）——与论文训练配方一致。
+- **Motus 式 seen 指令**：RoboTwin 默认 unseen，可 `instruction_type=seen` 切换——README 已说明。
+
+#### 未实现影响汇总（Mermaid）
+
+```mermaid
+flowchart TB
+  subgraph critical [复现论文核心论点]
+    A[w.o. video co-train]
+  end
+
+  subgraph sim_ok [仿真主表可复现]
+    B[LIBERO RoboTwin eval]
+    C[released ckpt]
+  end
+
+  subgraph external [官网扩展未开源]
+    D[真机毛巾]
+    E[latency script]
+  end
+
+  A -->|需 lambda_video=0| sim_ok
+  B --> sim_ok
+  C --> sim_ok
+  D -.->|不影响| sim_ok
+  E -.->|不影响| sim_ok
+```
+
+---
+
+### 11.6 复现论文表格：最小命令对照
+
+| 论文变体 | Hydra `task=` | 推理 API（部署） |
+|----------|---------------|----------------|
+| Fast-WAM | `libero_uncond_2cam224_1e-4` / `robotwin_uncond_3cam_384_1e-4` | `infer_action` |
+| Fast-WAM-Joint | `libero_joint_2cam224_1e-4` / `robotwin_joint_3cam_384_1e-4` | `infer_joint` |
+| Fast-WAM-IDM | `libero_idm_2cam224_1e-4` / `robotwin_idm_3cam_384_1e-4` | `infer_joint`（IDM 管线） |
+| w.o. video co-train | 同上 uncond task + `model.loss.lambda_video=0` | `infer_action` |
+
+训练前：`preprocess_action_dit_backbone.py`、`precompute_text_embeds.py`（第 5、10 章）。评测：第 5 章 `run_libero_manager.py` / `run_robotwin_manager.py` + HF release ckpt。
+
+**论文步数对齐示例**（LIBERO 20k）：
+
+```bash
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 max_steps=20000
+```
+
+RoboTwin 可设 `max_steps=30000`；多卡规模见 README（论文 64 GPU，本地可缩减）。
+
+---
+
+### 11.7 小结
+
+本地 [FastWAM](https://github.com/yuantianyuan01/FastWAM) 仓库**完整实现了论文的方法论主体**：MoT 双专家、首帧约束掩码、视频–动作联合 Flow Matching、以及论文最核心的 **`infer_action` + KV cache** 快速推理；Joint / IDM 与六套 `configs/task` 支撑 controlled comparison；LIBERO / RoboTwin 评测与 HF 权重使 **Table 1/2 的仿真部分可复现**。
+
+**未开源或需自行配置**的主要是：真机实验、官方延迟脚本、现成的 no-co-train task（可用 `lambda_video=0` 补上）。**易混淆点**：`model.infer()` 等价于慢的 `infer_joint`，而论文结论与部署依赖 `infer_action`；训练 `evaluate()` 亦走 joint 路径，监控指标不代表部署延迟。
+
+阅读代码时建议路径：**`runtime.create_fastwam` → `FastWAM.training_loss` / `infer_action` → `experiments/*/eval_*` 或 `deploy_policy.py`**，并对照本章总表核对论文每一项是否覆盖。
 
 ---
 

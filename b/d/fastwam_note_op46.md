@@ -1147,3 +1147,557 @@ Fast-WAM 本质上是这种理念在**具身智能**领域的一次成功验证�
 6. Lipman, Y. et al. (2023). *Flow Matching for Generative Modeling*. ICLR 2023.
 7. Peebles, W. & Xie, S. (2023). *Scalable Diffusion Models with Transformers*. ICCV 2023.
 8. Su, J. et al. (2024). *RoFormer: Enhanced Transformer with Rotary Position Embedding*. Neurocomputing.
+
+---
+
+## 11. 论文-代码对照分析
+
+> 本节系统比较论文（arXiv: 2603.16666）描述的全部内容与本地代码库 `src/fastwam/` 的实际实现，回答三个问题：**实现了什么？怎么实现的？缺了什么？缺失对效果有何影响？**
+
+### 11.1 总览：论文组件 vs 代码实现对照表
+
+| 论文组件 | 实现状态 | 代码位置 | 备注 |
+|----------|:--------:|----------|------|
+| **Fast-WAM（默认变体）** | ✅ 完整 | `fastwam.py:FastWAM` | training_loss + infer_action(KV cache) |
+| **Fast-WAM-Joint** | ✅ 完整 | `fastwam_joint.py:FastWAMJoint` | 继承 FastWAM，重写掩码 |
+| **Fast-WAM-IDM** | ✅ 完整 | `fastwam_idm.py:FastWAMIDM` | 两阶段推理 + teacher-forcing 训练 |
+| **w/o video co-training** | ⚠️ 缺配置 | 无现成配置文件 | 可通过设 `loss.lambda_video: 0` 实现 |
+| **MoT 混合注意力** | ✅ 完整 | `mot.py:MoT` | forward / prefill / forward_with_cache |
+| **结构化注意力掩码** | ✅ 完整 | 三个 `_build_*_mask` 方法 | 三变体各有独立掩码 |
+| **Flow Matching 训练** | ✅ 完整 | `scheduler_continuous.py` | shift-based 采样（非论文提及的 logit-normal） |
+| **Wan2.2 视频骨干** | ✅ 完整 | `wan_video_dit.py:WanVideoDiT` | 5B 参数，30 层 DiT |
+| **ActionDiT 动作专家** | ✅ 完整 | `action_dit.py:ActionDiT` | 1B 参数，线性插值初始化 |
+| **VAE 编解码** | ✅ 完整 | `wan_video_vae.py` | 时间 4×，空间 8× |
+| **T5 文本编码** | ✅ 完整 | `wan_video_text_encoder.py` + 预计算缓存 | 在线编码 + 离线缓存双模式 |
+| **本体感受编码** | ✅ 完整 | `fastwam.py:_append_proprio_to_context` | 线性投影拼接到 T5 context |
+| **LIBERO 评测流水线** | ✅ 完整 | `experiments/libero/` | 并行任务分发 + 结果汇总 |
+| **RoboTwin 评测流水线** | ✅ 完整 | `experiments/robotwin/` | 并行任务分发 + 结果汇总 |
+| **Classifier-Free Guidance** | ⚠️ 残留代码 | `wan22.py:Wan22Core`（遗留） | FastWAM 变体不使用，论文 cfg=1.0 |
+| **Action-conditioned Video** | ⚠️ 死代码 | `wan_video_dit.py` 有完整实现 | 所有配置 `action_conditioned: false` |
+| **真实机器人部署** | ❌ 未实现 | — | 无 Galaxea R1 Lite 控制代码 |
+| **CFG 训练时条件丢弃** | ❌ 未实现 | — | 训练时不丢弃文本/动作条件 |
+| **FID/FVD 视频指标** | ❌ 未实现 | — | 仅有 PSNR/SSIM |
+| **Re-planning 控制器** | ⚠️ 外部实现 | `configs/sim_robotwin.yaml` 的 `replan_steps` | 由 RoboTwin 模拟器处理 |
+
+图例：✅ 完整实现 | ⚠️ 部分/差异/残留 | ❌ 未实现
+
+---
+
+### 11.2 已完整实现的核心内容
+
+#### 11.2.1 三大模型变体——类继承结构
+
+代码通过继承实现了三个变体，共享大部分基础设施，仅在掩码构建和推理流程上有差异：
+
+```mermaid
+classDiagram
+    class FastWAM {
+        +video_expert: WanVideoDiT
+        +action_expert: ActionDiT
+        +mot: MoT
+        +vae: WanVideoVAE
+        +training_loss(sample) → loss, dict
+        +infer_action(image, prompt, ...) → action
+        +infer_joint(image, prompt, ...) → video, action
+        -_build_mot_attention_mask() → mask
+        -_predict_action_noise_with_cache()
+    }
+    
+    class FastWAMJoint {
+        -_build_mot_attention_mask() → mask ← 重写：action 看全部 video
+        +infer_joint() ← 重写：禁用 test_action_with_infer_action
+    }
+    
+    class FastWAMIDM {
+        +video_cond_noise_prob = 0.5
+        +training_loss(sample) → loss, dict ← 完全重写：三分支
+        +infer_action() ← 重写：调用 infer_joint
+        +infer_joint() ← 完全重写：两阶段推理
+        -_build_teacher_forcing_attention_mask() → mask ← 新增
+    }
+    
+    FastWAM <|-- FastWAMJoint : 继承
+    FastWAMJoint <|-- FastWAMIDM : 继承
+    FastWAM *-- MoT : 组合
+    FastWAM *-- WanVideoDiT : 组合
+    FastWAM *-- ActionDiT : 组合
+```
+
+**关键方法重写对照**：
+
+| 方法 | FastWAM | FastWAMJoint | FastWAMIDM |
+|------|:-------:|:------------:|:----------:|
+| `_build_mot_attention_mask` | 首帧掩码 | **全视频掩码** | 继承 Joint |
+| `training_loss` | 继承 | 继承 | **三分支 teacher-forcing** |
+| `infer_joint` | 联合去噪 | 继承（禁用交叉验证） | **两阶段去噪** |
+| `infer_action` | KV-cache 快速推理 | 继承 | **转发到 infer_joint** |
+
+#### 11.2.2 三变体掩码差异的精确对比
+
+```
+Fast-WAM 掩码:                    FastWAM-Joint 掩码:
+     f0  f1..fT  action                f0  f1..fT  action
+f0  [ 1    0      0  ]           f0  [ 1    0      0  ]
+f1  [ 1    1      0  ]    →      f1  [ 1    1      0  ]
+act [ 1    0      1  ]           act [ 1    1      1  ]  ← 动作看全部视频！
+
+FastWAM-IDM 训练掩码:
+     noisy_v  cond_v  action
+nv  [  1       0       0  ]     ← 噪声视频互相看
+cv  [  0       1       0  ]     ← 条件视频互相看  
+act [  0       1       1  ]     ← 动作只看条件视频 + 动作自身
+```
+
+对应代码：
+- Fast-WAM: `fastwam.py:_build_mot_attention_mask()` L386-407 — `mask[video_seq_len:, :first_frame_tokens] = True`
+- Joint: `fastwam_joint.py:_build_mot_attention_mask()` L29-49 — `mask[video_seq_len:, :video_seq_len] = True`
+- IDM: `fastwam_idm.py:_build_teacher_forcing_attention_mask()` L20-56 — 三段式掩码
+
+---
+
+### 11.3 三变体推理流程对比
+
+#### Fast-WAM：单次 Prefill + 动作去噪
+
+```mermaid
+sequenceDiagram
+    participant Img as 输入图像
+    participant VAE as VAE
+    participant VE as Video Expert
+    participant MoT as MoT
+    participant AE as Action Expert
+    
+    Img->>VAE: encode
+    VAE-->>VE: first_frame_latents
+    VE->>MoT: pre_dit(timestep=0)
+    MoT->>MoT: prefill_video_cache → 30层 K/V
+    
+    Note over MoT: 视频部分结束，以下仅动作
+    
+    loop 20 步去噪
+        AE->>MoT: action Q + cached video K/V
+        MoT-->>AE: updated action tokens
+    end
+    AE-->>Img: action [32, 7]
+```
+
+**延迟**: ~190 ms（1 次 video forward + 20 × action-only forward）
+
+#### Fast-WAM-Joint：完整联合去噪
+
+```mermaid
+sequenceDiagram
+    participant Img as 输入图像
+    participant VAE as VAE
+    participant VE as Video Expert
+    participant MoT as MoT
+    participant AE as Action Expert
+    
+    Img->>VAE: encode → first_frame + random noise video/action
+    
+    loop 20 步去噪
+        VE->>MoT: video tokens (含未来帧噪声)
+        AE->>MoT: action tokens (噪声)
+        MoT->>MoT: 完整联合 attention (Sv+Sa)²
+        MoT-->>VE: updated video tokens
+        MoT-->>AE: updated action tokens
+        VE->>VE: scheduler.step → 更新 video latents
+        AE->>AE: scheduler.step → 更新 action latents
+    end
+    VE-->>Img: video frames + action [32, 7]
+```
+
+**延迟**: ~760+ ms（每步都跑完整 5B Video DiT）
+
+#### Fast-WAM-IDM：两阶段去噪
+
+```mermaid
+sequenceDiagram
+    participant Img as 输入图像
+    participant VAE as VAE
+    participant VE as Video Expert (standalone)
+    participant MoT as MoT
+    participant AE as Action Expert
+    
+    Note over VE: === Stage 1: 视频去噪（无动作参与）===
+    Img->>VAE: encode → first_frame_latents
+    
+    loop 20 步去噪
+        VE->>VE: 独立视频去噪（video_expert.forward）
+        Note over VE: 不经过 MoT！直接调用 video_expert
+    end
+    
+    Note over MoT: === Stage 2: 冻结视频，动作去噪 ===
+    VE->>MoT: pre_dit(denoised_video, timestep=0)
+    MoT->>MoT: prefill_video_cache → 30层 K/V
+    
+    loop 20 步去噪
+        AE->>MoT: action Q + cached video K/V
+        MoT-->>AE: updated action tokens
+    end
+    AE-->>Img: video frames + action [32, 7]
+```
+
+**延迟**: ~810 ms（20 步视频去噪 + 1 次 prefill + 20 步动作去噪）
+
+**关键实现差异**（`fastwam_idm.py:380-452`）：
+- Stage 1 直接调用 `self.video_expert(x=latents_video, ...)` 而非经过 MoT——这意味着视频去噪时**动作信息完全不参与**
+- Stage 2 使用 `prefill_video_cache` + `_predict_action_noise_with_cache`，与 Fast-WAM 的推理路径相同
+
+---
+
+### 11.4 IDM 训练数据流——三分支 Teacher-Forcing
+
+IDM 的 `training_loss()`（`fastwam_idm.py:58-227`）是最复杂的变体，涉及三个并行分支：
+
+```mermaid
+flowchart TB
+  subgraph Input ["输入"]
+    GT["GT 视频 latents + GT 动作 + T5 context"]
+  end
+  
+  subgraph BranchA ["Branch A: Noisy Video（视频去噪目标）"]
+    NoiseV["ε_v ~ N(0,I)"]
+    TV["t_v ~ phi(U, 5.0) × 1000"]
+    NoiseV --> AddV["add_noise(gt_latents, ε_v, t_v)"]
+    TV --> AddV
+    AddV --> NoisyV["noisy_latents\n(首帧替换为干净)"]
+  end
+  
+  subgraph BranchB ["Branch B: Action（动作去噪目标）"]
+    NoiseA["ε_a ~ N(0,I)"]
+    TA["t_a ~ phi(U, 5.0) × 1000"]
+    NoiseA --> AddA["add_noise(gt_action, ε_a, t_a)"]
+    TA --> AddA
+    AddA --> NoisyA["noisy_action"]
+  end
+  
+  subgraph BranchC ["Branch C: Cond-Video（Teacher Forcing 条件）"]
+    Coin["Bernoulli(p=0.5)"]
+    Coin -->|"加噪"| AddC["add_noise(gt_latents, ε_c, t_c)"]
+    Coin -->|"不加噪"| Clean["gt_latents 原样\n(timestep=0)"]
+    AddC --> CondV["cond_latents"]
+    Clean --> CondV
+  end
+  
+  Input --> BranchA
+  Input --> BranchB
+  Input --> BranchC
+  
+  NoisyV --> PreV1["video_expert.pre_dit(noisy)"]
+  CondV --> PreV2["video_expert.pre_dit(cond)"]
+  NoisyA --> PreA["action_expert.pre_dit"]
+  
+  PreV1 --> Concat["拼接: [noisy_v_tokens | cond_v_tokens]"]
+  PreV2 --> Concat
+  
+  Concat --> MoT["MoT.forward()\n带 teacher-forcing mask"]
+  PreA --> MoT
+  
+  MoT --> SplitV["取 noisy 半部分 → post_dit"]
+  MoT --> SplitA["取 action 部分 → post_dit"]
+  
+  SplitV --> LossV["L_vid: MSE × w(t_v)"]
+  SplitA --> LossA["L_act: MSE × w(t_a)"]
+  LossV --> Total["L = λ_vid × L_vid + λ_act × L_act"]
+  LossA --> Total
+```
+
+**Teacher-Forcing 的精妙之处**：
+
+1. **条件视频的 50% 噪声增强**（`video_cond_noise_prob = 0.5`）：训练时随机对条件视频加噪，使模型学会从不完美的视频预测中提取动作信息——这对推理时的泛化至关重要，因为 Stage 1 生成的视频不可能完美
+2. **注意力掩码隔离**：noisy-video 和 cond-video 互不可见，action 只看 cond-video——这模拟了推理时的两阶段结构
+3. **仅 noisy 半部分计算视频损失**：`pred_video_tokens = tokens_out["video"][:, :noisy_video_seq_len]`——cond-video 的目的是提供条件信号，不参与视频损失
+
+---
+
+### 11.5 已实现但存在差异的部分
+
+#### 11.5.1 噪声采样分布
+
+| | 论文描述 | 代码实现 |
+|---|---|---|
+| 分布 | Logit-normal distribution | Uniform \(u \sim U(0,1)\) + shift-based \(\phi(u,s)\) |
+| 公式 | — | \(\phi(u, s) = \frac{s \cdot u}{1 + (s-1) \cdot u}\)，\(t = \phi(u,s) \times T\) |
+| 效果 | 偏向中间噪声水平 | 偏向高噪声端（shift=5.0 时） |
+
+**差异分析**：两种分布都实现了「非均匀时间步采样」的目标，但侧重点不同。Logit-normal 产生对称的钟形分布集中在 \(t=0.5\) 附近，而 shift-based 采样在 \(s>1\) 时偏向高噪声端。实际上，Wan2.2 官方实现使用的就是 shift-based 采样，论文可能是用 "logit-normal" 对这种非均匀采样的简化描述。配合训练权重函数 \(w(t)\)（在 \(t=T/2\) 处最大）后，两种方案的训练效果差异应当很小。
+
+#### 11.5.2 Classifier-Free Guidance（CFG）
+
+**论文**：推理时使用 `cfg_scale = 1.0`，即**实质上禁用了 CFG**。
+
+**代码现状**：
+
+```mermaid
+flowchart LR
+  subgraph Legacy ["遗留代码 (wan22.py:Wan22Core)"]
+    CFG_Text["text_cfg_scale ≠ 1.0 时\n双前向 + 引导公式"]
+    CFG_Act["action_cfg_scale ≠ 1.0 时\n零动作对照"]
+  end
+  
+  subgraph FastWAM ["FastWAM 变体（实际使用）"]
+    FW["FastWAM.infer_action()\ntext_cfg_scale=1.0\n→ 不触发 CFG"]
+    Joint["FastWAMJoint.infer_joint()\n传递但不使用"]
+    IDM["FastWAMIDM.infer_joint()\ndel negative_prompt, text_cfg_scale\n← 直接删除参数！"]
+  end
+  
+  Legacy -.->|"未被调用"| FastWAM
+```
+
+**结论**：CFG 基础设施完整存在于遗留 `Wan22Core` 中，但三个 FastWAM 变体均不使用。这与论文 `cfg_scale=1.0` 的设定一致——CFG 在 Fast-WAM 场景下被有意禁用。原因可能是：机器人操作的文本指令通常是明确的任务描述，不需要像通用文本-视频生成那样做无条件引导。
+
+#### 11.5.3 Action-Conditioned Video（动作条件视频生成）
+
+`WanVideoDiT` 在代码层面**完整实现**了动作条件视频生成（`action_conditioned` 参数控制）：
+
+- 当启用时，Action embedding 层被创建：`nn.Linear(action_dim, hidden_dim)`
+- GT 动作被编码为 token 拼接到 T5 context 中
+- 通过 `group_diagonal` 掩码控制每帧只看对应时间步的动作
+
+然而，**所有配置文件** (`fastwam.yaml`, `fastwam_joint.yaml`, `fastwam_idm.yaml`) 都设为 `action_conditioned: false`。
+
+这意味着当前 Fast-WAM 的视频生成**不以 GT 动作为条件**——视频骨干仅根据当前观测和语言指令预测未来。这可能是有意为之：动作条件会引入训练-推理不一致（推理时没有 GT 动作可用），除非配合 CFG 在推理时丢弃动作条件。
+
+---
+
+### 11.6 未实现的部分
+
+#### 11.6.1 w/o Video Co-training 变体
+
+**论文作用**：这是论文最关键的消融实验——去掉视频 co-training 后性能下降 4-8 分，直接支撑核心命题。
+
+**代码现状**：无现成配置文件。但实现极其简单：
+
+```yaml
+# 只需创建一个新的 task config，覆盖 loss.lambda_video
+# configs/task/libero_no_video_2cam224_1e-4.yaml
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam
+  - _self_
+
+model:
+  loss:
+    lambda_video: 0.0  # ← 关键：视频损失权重设为 0
+
+# 其余参数同 libero_uncond_2cam224_1e-4.yaml
+```
+
+代码已支持 `loss_lambda_video` 参数（`fastwam.py` L39, L86, L563），只是没有预置配置。
+
+#### 11.6.2 真实机器人部署代码
+
+论文在 Galaxea R1 Lite 上完成了折叠毛巾实验，但代码库**完全没有真机相关代码**：
+
+| 缺失内容 | 说明 |
+|----------|------|
+| 机器人控制接口 | 无 ROS / 自定义控制 API |
+| 实时推理循环 | 无 observation → action → execute 闭环 |
+| 相机标定/配置 | 无真实相机参数 |
+| 数据采集脚本 | 无遥操作数据录制工具 |
+| 安全机制 | 无碰撞检测/急停逻辑 |
+
+仅有 LIBERO（MuJoCo）和 RoboTwin（Isaac Gym）两种仿真评测。
+
+#### 11.6.3 CFG 训练时条件丢弃
+
+有效的 CFG 需要在训练时以一定概率丢弃条件信号（如随机用空字符串替换文本指令）。代码中**没有此实现**——训练时文本条件始终存在。由于论文使用 `cfg_scale=1.0`（不启用 CFG），这不影响当前结果，但限制了未来启用 CFG 的能力。
+
+#### 11.6.4 FID/FVD 视频质量指标
+
+仅实现了像素级指标（`video_metrics.py`）：
+
+| 已实现 | 未实现 |
+|--------|--------|
+| PSNR（峰值信噪比） | FID（Fréchet Inception Distance） |
+| SSIM（结构相似性） | FVD（Fréchet Video Distance） |
+
+FID/FVD 需要预训练的特征提取器（如 I3D），属于评测工具而非模型本身。
+
+#### 11.6.5 Re-planning 控制器
+
+论文提及的 re-planning 行为（每隔 N 步重新预测动作 chunk）由**外部仿真器**处理：
+
+```yaml
+# configs/sim_robotwin.yaml
+replan_steps: 24  # 每 24 步重新调用模型
+skip_get_obs_within_replan: false  # 是否跳过中间观测获取
+```
+
+这意味着 re-planning 逻辑在 `third_party/RoboTwin/script/eval_policy.py` 中，而非 FastWAM 模型内部。模型只负责给定一帧观测输出 32 步动作。
+
+---
+
+### 11.7 缺失部分对算法效果的影响分析
+
+```mermaid
+flowchart LR
+  subgraph Critical ["🔴 影响核心结论复现"]
+    NoVid["w/o video 配置缺失\n→ 无法本地复现消融"]
+    RealBot["真机代码缺失\n→ 无法复现 Table 3/Fig.5"]
+  end
+  
+  subgraph Minor ["🟢 对当前算法效果无影响"]
+    CFG["CFG 训练丢弃缺失\n论文 cfg=1.0 不用"]
+    FID["FID/FVD 缺失\n仅评测完整性"]
+    Replan["Re-planning 外部化\n不影响模型质量"]
+  end
+  
+  subgraph Potential ["🟡 限制未来扩展"]
+    ActCond["Action-conditioned 禁用\n可能的改进方向"]
+    CFGFuture["CFG 无训练支持\n无法在新场景启用"]
+  end
+```
+
+**逐项分析**：
+
+| 缺失 | 影响级别 | 详细分析 |
+|------|:--------:|----------|
+| **w/o video 配置** | 🔴 高 | 论文最核心消融（Table 1/2 最后一行）无法本地复现。但修复极简单——创建一个 `lambda_video: 0` 的配置文件即可 |
+| **真机代码** | 🔴 高 | 论文 Table 3 和 Figure 5 的真机折叠毛巾实验完全无法复现。需要 Galaxea R1 Lite 硬件 + 专用控制栈 |
+| **CFG 训练丢弃** | 🟢 无 | 论文推理时 `cfg_scale=1.0` 等价于不使用 CFG，因此训练时是否丢弃条件无关紧要 |
+| **FID/FVD** | 🟢 无 | 这些是评估视频生成质量的指标，论文主要关注任务成功率而非视频质量 |
+| **Re-planning** | 🟢 无 | 由仿真器的 receding horizon 控制循环处理，模型只需支持 `infer_action()` 接口即可 |
+| **Action-conditioned** | 🟡 中 | 代码基础设施完整但禁用。启用后可能改善视频预测质量（视频知道动作将如何执行），但需配合 CFG 解决训练-推理不一致 |
+
+---
+
+### 11.8 代码中有但论文未明确描述的实现细节
+
+以下是代码中存在但论文未详细展开的重要技术决策：
+
+#### 11.8.1 Separated Timestep（分离时间步嵌入）
+
+`wan_video_dit.py` 中 `seperated_timestep: true` 使**每个 token 获得独立的时间步嵌入**，而非整个序列共享一个。这意味着：
+- 首帧所有 token 的 \(t=0\)（干净输入信号）
+- 未来帧所有 token 的 \(t=t_\text{sampled}\)（噪声水平信号）
+
+这创造了一种**时间步感知的位置编码**——模型可以从 AdaLN 调制信号中区分"当前真实观测"和"未来噪声预测"。
+
+\[
+t_\text{mod}(i,j) = \text{project}\left(\text{sinusoidal}(\delta_{i=0} \cdot 0 + (1-\delta_{i=0}) \cdot t)\right)
+\]
+
+其中 \(i\) 是帧索引，\(j\) 是帧内空间位置，\(\delta_{i=0}\) 是首帧指示函数。
+
+#### 11.8.2 Delta Action Mask
+
+`configs/data/libero_2cam.yaml` 中：
+```yaml
+delta_action_dim_mask:
+  default: [true, true, true, true, true, true, false]
+```
+
+前 6 维（末端执行器位姿）使用**增量动作**（\(\Delta\) pose），第 7 维（夹爪）使用**绝对值**。这种混合空间设计确保夹爪状态不会因累积误差而漂移。
+
+#### 11.8.3 两级梯度检查点
+
+代码提供了精细的内存-计算权衡控制：
+
+| 级别 | 开关 | 作用域 | 效果 |
+|------|------|--------|------|
+| Level 1 | `mot_checkpoint_mixed_attn` | MoT 联合注意力 | 检查点 Flash Attention 计算 |
+| Level 2 | `use_gradient_checkpointing` | DiTBlock post-block | 检查点 cross-attn + FFN |
+
+任务配置 `libero_uncond_2cam224_1e-4.yaml` 将 `mot_checkpoint_mixed_attn: false`（关闭检查点换取速度），而模型默认配置设为 `true`（节省内存）。
+
+#### 11.8.4 T5 嵌入预计算缓存
+
+训练时通过 `scripts/precompute_text_embeds.py` 一次性生成所有任务的 T5 嵌入并保存到 `data/text_embeds_cache/`。数据集加载时直接读取 \([L, 4096]\) 张量，跳过 T5 前向——节省约 **1.3B 参数的显存和计算**。
+
+#### 11.8.5 IDM 条件视频噪声增强概率
+
+`FastWAMIDM.video_cond_noise_prob = 0.5` 是一个硬编码的超参数，论文提及但未讨论如何选择。50% 的概率意味着：
+- 一半训练样本中，动作专家看到的是**干净的 GT 视频**（理想情况）
+- 另一半中，看到的是**加了随机噪声的视频**（模拟推理时的不完美视频预测）
+
+这种数据增强策略类似于 scheduled sampling，在 teacher-forcing 和 free-running 之间做插值。
+
+---
+
+### 11.9 关键实现细节的代码逻辑
+
+#### 11.9.1 Fast-WAM 推理的完整调用链
+
+```
+FastWAM.infer_action()                          [fastwam.py:906]
+├── _encode_input_image_latents_tensor()         [fastwam.py:254] → VAE 编码
+├── encode_prompt() 或使用预计算 context          [fastwam.py:202]
+├── _append_proprio_to_context()                 [fastwam.py:219] → 可选 proprio
+├── video_expert.pre_dit(timestep=0)             [wan_video_dit.py:509]
+│   ├── patchify (Conv3d)                        → [B, T*H'*W', 3072]
+│   ├── sinusoidal_embedding_1d(t=0)             → per-token timestep
+│   ├── text_embedding(context)                  → [B, L, 3072]
+│   └── compute 3D RoPE freqs                   → [S, 1, 128]
+├── _build_mot_attention_mask()                  [fastwam.py:386]
+├── mot.prefill_video_cache()                    [mot.py:257]
+│   └── for layer in 30:
+│       ├── _build_expert_attention_io()         → Q, K, V + post-block state
+│       ├── _mixed_attention(Q, K, V, mask)      → Flash Attention
+│       ├── _apply_post_with_optional_checkpoint → cross-attn + FFN
+│       └── cache.append({K, V})
+├── infer_action_scheduler.build_inference_schedule(steps=20)
+└── for step in 20:
+    ├── action_expert.pre_dit(noisy_action, t_i) [action_dit.py:226]
+    │   ├── action_encoder (Linear)              → [B, 32, 1024]
+    │   ├── sinusoidal_embedding_1d(t_i)         → timestep embed
+    │   └── text_embedding(context)              → [B, L, 1024]
+    ├── mot.forward_action_with_video_cache()     [mot.py:343]
+    │   └── for layer in 30:
+    │       ├── build action Q, K, V
+    │       ├── K_cat = [K_video_cached; K_action]
+    │       ├── V_cat = [V_video_cached; V_action]
+    │       └── flash_attention(Q_a, K_cat, V_cat, mask)
+    ├── action_expert.post_dit(tokens)           → pred_noise [B, 32, 7]
+    └── scheduler.step(pred, delta, latents)     → updated latents
+
+返回: {action: [32, 7]}
+```
+
+#### 11.9.2 训练 loss 的核心数学实现
+
+`training_loss` 中的损失计算可以展开为以下步骤：
+
+**Step 1**: 独立采样两套噪声和时间步
+
+\[
+\epsilon_v \sim \mathcal{N}(0,I), \quad t_v = \phi(u_v, 5) \times 1000, \quad u_v \sim U(0,1)
+\]
+\[
+\epsilon_a \sim \mathcal{N}(0,I), \quad t_a = \phi(u_a, 5) \times 1000, \quad u_a \sim U(0,1)
+\]
+
+**Step 2**: 构造加噪样本和目标
+
+\[
+z_t = (1 - \sigma_v) z_0 + \sigma_v \epsilon_v, \quad \text{target}_v = \epsilon_v - z_0
+\]
+\[
+a_t = (1 - \sigma_a) a_0 + \sigma_a \epsilon_a, \quad \text{target}_a = \epsilon_a - a_0
+\]
+
+**Step 3**: 前向传播（经过 MoT 联合注意力）
+
+\[
+[\hat{v}, \hat{a}] = \text{MoT}(\text{pre\_dit}_v(z_t, t_v), \text{pre\_dit}_a(a_t, t_a), M)
+\]
+
+**Step 4**: 加权损失
+
+\[
+\mathcal{L} = \lambda_v \cdot \underbrace{\frac{1}{B}\sum_i \tilde{w}(t_i^v) \cdot \text{MSE}(\hat{v}_i, \text{target}_i^v)}_{\mathcal{L}_\text{vid}} + \lambda_a \cdot \underbrace{\frac{1}{B}\sum_i \tilde{w}(t_i^a) \cdot \text{MSE}(\hat{a}_i, \text{target}_i^a)}_{\mathcal{L}_\text{act}}
+\]
+
+其中 padding 位置通过 `action_is_pad` 和 `image_is_pad` 掩码排除。
+
+---
+
+### 11.10 总结
+
+本地代码库高度忠实地实现了论文的核心方法和全部三个模型变体（Fast-WAM、Joint、IDM），包括训练和推理的完整流水线。主要的"缺口"集中在两方面：
+
+1. **实验复现**：w/o video 消融需要补一个简单的配置文件；真机实验需要专用硬件和控制栈，不在开源范围内
+2. **功能扩展**：CFG 训练支持和 action-conditioned video 是完整但未启用的代码基础设施，为未来改进留有空间
+
+从算法效果角度看，**所有影响模型训练和推理质量的核心组件都已完整实现**——缺失的部分要么是评测工具（FID/FVD），要么是被论文有意禁用的功能（CFG），要么是外部系统（真机控制、re-planning 循环）。
