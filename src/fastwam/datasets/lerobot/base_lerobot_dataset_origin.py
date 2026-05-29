@@ -68,45 +68,38 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         delta_timestamps = {}
         for meta in self.image_meta:
             key = meta["key"]
-            meta["lerobot_key"] = meta.get("lerobot_key") or (
-                f"observation.images.{key}" if key != "default" else "observation.images"
-            )
+            meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
                 (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
         
         for meta in self.state_meta:
             key = meta["key"]
-            meta["lerobot_key"] = meta.get("lerobot_key") or (
-                f"observation.state.{key}" if key != "default" else "observation.state"
-            )
+            meta["lerobot_key"] = f"observation.state.{key}" if key != "default" else "observation.state"
             delta_timestamps[meta["lerobot_key"]] = [
                 (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
         
         for meta in self.action_meta:
             key = meta["key"]
-            meta["lerobot_key"] = meta.get("lerobot_key") or (
-                f"action.{key}" if key != "default" else "action"
-            )
+            meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
-        for meta in metas:
-            episode_indices = sorted(meta.episodes.keys())
-            if val_set_proportion < 1e-6:
-                selected_episode_indices = episode_indices
-            else:
-                split_idx = int(len(episode_indices) * (1 - val_set_proportion))
-                # Shuffle actual episode ids; some converted datasets may have non-contiguous indices.
-                episode_indices = episode_indices.copy()
+        if val_set_proportion < 1e-6:
+            for meta in metas:
+                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
+        else:
+            for meta in metas:
+                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
+                # random shuffle episode indices before splitting
+                episode_indices = list(range(meta.total_episodes))
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    selected_episode_indices = episode_indices[:split_idx]
+                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
                 else:
-                    selected_episode_indices = episode_indices[split_idx:]
-            episodes.update({meta.repo_id: selected_episode_indices})
+                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,
