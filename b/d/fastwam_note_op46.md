@@ -1701,3 +1701,972 @@ a_t = (1 - \sigma_a) a_0 + \sigma_a \epsilon_a, \quad \text{target}_a = \epsilon
 2. **功能扩展**：CFG 训练支持和 action-conditioned video 是完整但未启用的代码基础设施，为未来改进留有空间
 
 从算法效果角度看，**所有影响模型训练和推理质量的核心组件都已完整实现**——缺失的部分要么是评测工具（FID/FVD），要么是被论文有意禁用的功能（CFG），要么是外部系统（真机控制、re-planning 循环）。
+
+---
+
+## 12. 训练 Pipeline 深度拆解
+
+> 本节从命令行入口开始，逐层追踪到梯度更新的最内层，完整呈现 FastWAM 训练流水线的每一个环节。所有序列图、数据流图、类图均用 Mermaid 绘制，数学公式用 LaTeX 表示。
+
+### 12.1 训练 Pipeline 全景图
+
+```mermaid
+flowchart TB
+  subgraph CLI ["命令行入口"]
+    Shell["train_zero1.sh\naccelerate launch"]
+    Shell --> TrainPy["scripts/train.py\n@hydra.main()"]
+  end
+  
+  subgraph Runtime ["运行时编排 (runtime.py)"]
+    TrainPy --> RunTrain["run_training(cfg)"]
+    RunTrain --> CreateModel["create_fastwam()\nWan2.2 加载 + 组装"]
+    RunTrain --> BuildDS["build_datasets()\n训练/验证集"]
+  end
+  
+  subgraph Trainer ["训练器 (trainer.py)"]
+    CreateModel --> TrainerInit["Wan22Trainer.__init__()\nAccelerator + 优化器 + 调度器"]
+    BuildDS --> TrainerInit
+    TrainerInit --> TrainLoop["trainer.train()\n主训练循环"]
+  end
+  
+  subgraph Loop ["训练循环核心"]
+    TrainLoop --> GetBatch["DataLoader → sample"]
+    GetBatch --> Forward["model.training_loss(sample)"]
+    Forward --> Backward["accelerator.backward(loss)"]
+    Backward --> Step["clip_grad → optimizer.step\nscheduler.step"]
+    Step --> Log["日志 / 评估 / 检查点"]
+    Log -->|"global_step < max_steps"| GetBatch
+  end
+  
+  subgraph ModelForward ["模型前向传播"]
+    Forward --> BuildInputs["build_inputs()\nVAE 编码"]
+    BuildInputs --> Noise["采样噪声 + 时间步"]
+    Noise --> PreDit["pre_dit()\nvideo + action 预处理"]
+    PreDit --> MoT["MoT.forward()\n30 层混合注意力"]
+    MoT --> PostDit["post_dit()\n输出预测"]
+    PostDit --> Loss["MSE 损失 × 权重"]
+  end
+```
+
+**涉及文件全表**：
+
+| 文件 | 层次 | 核心职责 |
+|------|------|----------|
+| `scripts/train_zero1.sh` | 启动 | DeepSpeed accelerate launch |
+| `scripts/train.py` | 入口 | Hydra 配置加载，调用 `run_training` |
+| `src/fastwam/runtime.py` | 编排 | 模型工厂 + 数据集构建 + 训练启动 |
+| `src/fastwam/trainer.py` | 训练器 | 训练循环 + 评估 + 检查点 |
+| `src/fastwam/datasets/lerobot/robot_video_dataset.py` | 数据 | 视频/动作/文本样本构建 |
+| `src/fastwam/datasets/lerobot/processors/fastwam_processor.py` | 处理 | 归一化 + 增量动作 + 合并 |
+| `src/fastwam/datasets/lerobot/utils/normalizer.py` | 工具 | min-max / z-score 归一化 |
+| `src/fastwam/utils/samplers.py` | 工具 | 可恢复分布式采样器 |
+| `src/fastwam/models/wan22/fastwam.py` | 模型 | 顶层模型：build_inputs + training_loss |
+| `src/fastwam/models/wan22/wan_video_dit.py` | 模型 | 视频专家：pre_dit + post_dit + DiTBlock |
+| `src/fastwam/models/wan22/action_dit.py` | 模型 | 动作专家：pre_dit + post_dit |
+| `src/fastwam/models/wan22/mot.py` | 模型 | MoT 混合注意力 |
+| `src/fastwam/models/wan22/schedulers/scheduler_continuous.py` | 调度 | Flow Matching 噪声调度 |
+| `scripts/preprocess_action_dit_backbone.py` | 预处理 | ActionDiT 权重线性插值 |
+| `scripts/precompute_text_embeds.py` | 预处理 | T5 嵌入缓存 |
+
+---
+
+### 12.2 启动与配置层
+
+#### 12.2.1 配置组合机制
+
+FastWAM 使用 **Hydra** 配置框架，通过 `defaults` 列表实现模块化配置组合：
+
+```mermaid
+flowchart LR
+  subgraph TaskConfig ["task/libero_uncond_2cam224_1e-4.yaml"]
+    TC["defaults:\n  - override /data: libero_2cam\n  - override /model: fastwam\nbatch_size: 16\nlearning_rate: 1e-4\nnum_epochs: 10"]
+  end
+  
+  subgraph ModelConfig ["model/fastwam.yaml"]
+    MC["_target_: fastwam.runtime.create_fastwam\nvideo_dit_config:\n  hidden_dim: 3072\n  num_layers: 30\naction_dit_config:\n  hidden_dim: 1024"]
+  end
+  
+  subgraph DataConfig ["data/libero_2cam.yaml"]
+    DC["_target_: ...RobotVideoDataset\nnum_frames: 33\naction_video_freq_ratio: 4\nvideo_size: [224, 448]"]
+  end
+  
+  subgraph BaseConfig ["train.yaml"]
+    BC["mixed_precision: bf16\nseed: 42\nmax_grad_norm: 1.0\nwandb: ..."]
+  end
+  
+  TC --> |"override"| MC
+  TC --> |"override"| DC
+  BC --> |"defaults"| TC
+```
+
+最终合并的配置是一个深层嵌套的 `DictConfig`，所有的 `${...}` 引用在运行时解析。例如 `action_dim: ${data.train.processor.action_output_dim}` 会被替换为 7。
+
+#### 12.2.2 训练入口：三行代码的力量
+
+`scripts/train.py` 是整个训练系统的入口，仅有 **6 行有效代码**：
+
+```python
+from fastwam.runtime import run_training, register_default_resolvers
+register_default_resolvers()
+
+@hydra.main(config_path="../configs", config_name="train", version_base="1.3")
+def main(cfg: DictConfig):
+    run_training(cfg)
+```
+
+Hydra 会自动扫描 `configs/` 目录，根据 `defaults` 列表合并所有 YAML，然后将合并后的配置传给 `main()`。
+
+#### 12.2.3 DeepSpeed 启动
+
+`scripts/train_zero1.sh` 通过 HuggingFace Accelerate 启动分布式训练：
+
+```bash
+accelerate launch \
+  --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
+  --num_processes "${NPROC_PER_NODE}" \
+  scripts/train.py \
+  "output_dir=./runs/${TASK}/${RUN_ID}" \
+  "${EXTRA_ARGS[@]}"
+```
+
+关键参数：
+- **ZeRO Stage 1**：只分片优化器状态（每个 GPU 保存完整模型 + 梯度）
+- **bf16 混合精度**：平衡精度与速度
+- **多机支持**：通过 TCPStore 同步 run ID
+
+---
+
+### 12.3 运行时编排层
+
+`runtime.py:run_training()`（L359-381）是训练的总指挥：
+
+```mermaid
+sequenceDiagram
+    participant Main as train.py
+    participant RT as runtime.py
+    participant Model as FastWAM
+    participant DS as RobotVideoDataset
+    participant Trainer as Wan22Trainer
+    
+    Main->>RT: run_training(cfg)
+    
+    Note over RT: 1. 设备与精度
+    RT->>RT: _resolve_train_device() → "cuda:0"
+    RT->>RT: _normalize_mixed_precision() → "bf16"
+    
+    Note over RT: 2. 模型创建
+    RT->>Model: instantiate(cfg.model) → create_fastwam()
+    activate Model
+    Model->>Model: load_wan22_ti2v_5b_components()
+    Note over Model: 加载 Wan2.2 预训练权重:<br/>VAE + Video DiT + T5
+    Model->>Model: ActionDiT.from_pretrained()
+    Note over Model: 线性插值初始化 Action DiT
+    Model->>Model: MoT(video_expert, action_expert)
+    Model->>Model: FastWAM(video, action, mot, vae, ...)
+    deactivate Model
+    
+    Note over RT: 3. 数据集构建
+    RT->>DS: build_datasets(cfg.data)
+    activate DS
+    DS->>DS: RobotVideoDataset(train)
+    DS->>DS: compute_normalization_stats()
+    DS->>DS: RobotVideoDataset(val)
+    deactivate DS
+    
+    Note over RT: 4. 训练器启动
+    RT->>Trainer: Wan22Trainer(model, train_ds, val_ds, cfg)
+    Trainer->>Trainer: __init__() → Accelerator + AdamW + Scheduler
+    RT->>Trainer: trainer.train()
+    Note over Trainer: 进入主训练循环
+```
+
+#### 模型工厂：create_fastwam()
+
+`create_fastwam()`（L76-158）的组装步骤：
+
+1. **加载 Wan2.2 预训练组件**：`load_wan22_ti2v_5b_components()` → VAE, Video DiT (5B), T5 Text Encoder, Tokenizer
+2. **构建 Action DiT**：`ActionDiT.from_pretrained()` → 从预处理的 backbone 文件加载（线性插值权重）
+3. **组装 MoT**：`MoT({"video": video_expert, "action": action_expert})`
+4. **创建 FastWAM**：传入所有组件 + 调度器配置 + 损失权重
+
+三个工厂函数的差异仅在于返回的类不同：
+- `create_fastwam()` → `FastWAM`
+- `create_fastwam_joint()` → `FastWAMJoint`
+- `create_fastwam_idm()` → `FastWAMIDM`
+
+---
+
+### 12.4 数据流水线层
+
+#### 12.4.1 RobotVideoDataset：从磁盘到训练样本
+
+```mermaid
+flowchart TB
+  subgraph Init ["__init__() 初始化"]
+    LeRobot["BaseLerobotDataset\n加载 LeRobot 格式 episode"]
+    Indices["video_sample_indices\n= [0, 4, 8, ..., 32]\n(stride=4, 9帧)"]
+    Transforms["图像变换链\nResize → CenterCrop → Normalize"]
+    Stats["归一化统计\ncompute → broadcast → set"]
+  end
+  
+  subgraph GetItem ["__getitem__(idx) 采样流程"]
+    Raw["LeRobot sample\n{pixel_values, action, state, instruction, ...}"]
+    
+    subgraph VideoProc ["视频处理"]
+      FrameSample["帧采样\nvideo_sample_indices"]
+      MultiCam["多相机拼接\nhorizontal: 224×224 × 2 → 224×448"]
+      VidTransform["Resize → CenterCrop → Normalize\n→ [C, T, H, W], 值域 [-1,1]"]
+    end
+    
+    subgraph ActionProc ["动作/状态处理"]
+      ActionRaw["action [32, 7]\nstate [33, 8]"]
+      Processor["FastWAMProcessor.preprocess()"]
+    end
+    
+    subgraph TextProc ["文本处理"]
+      Instruction["instruction 构建"]
+      Cache["T5 缓存查找\nSHA256(prompt) → .pt 文件"]
+      Context["context [128, 4096]\ncontext_mask [128]"]
+    end
+    
+    Raw --> FrameSample --> MultiCam --> VidTransform
+    Raw --> ActionRaw --> Processor
+    Raw --> Instruction --> Cache --> Context
+  end
+```
+
+**帧采样细节**：
+
+配置 `num_frames=33, action_video_freq_ratio=4` 意味着：
+- 原始 33 帧中，每隔 4 帧取 1 帧视频：`video_sample_indices = [0, 4, 8, 12, 16, 20, 24, 28, 32]` → **9 帧视频**
+- 动作保持原频率：**32 步动作**（比视频快 4×）
+- 约束：`(33-1) % 4 == 0` 且 `(33-1) / 4 % 4 == 0`（VAE 时间维要求）
+
+**多相机拼接模式**：
+
+| 模式 | LIBERO (2 cam) | RoboTwin (3 cam) |
+|------|:---:|:---:|
+| `horizontal` | 224×224 + 224×224 → 224×448 | — |
+| `robotwin` | — | top(256×320) + [left(128×160)\|right(128×160)] → 384×320 |
+
+#### 12.4.2 FastWAMProcessor：归一化与合并
+
+```mermaid
+flowchart TB
+  Input["原始 sample dict"] --> InstAug["指令增强\n[High]: ... [Low]: ...\n随机丢弃 high-level"]
+  Input --> ImgTrans["图像变换\nToTensor → Resize(224)"]
+  Input --> DeltaMask["Delta Action Mask\n前6维(EEF)=增量, 第7维(夹爪)=绝对\n→ padding 位置的增量维归零"]
+  
+  DeltaMask --> ActStateTrans["Action-State Transform\n可选的坐标变换链"]
+  ActStateTrans --> Normalize["LinearNormalizer.forward()\nmin-max → [-1, 1]\n(clamp 到 [-5, 5])"]
+  Normalize --> Merge["ConcatLeftAlign.forward()\n多 key 拼接 + 维度 padding"]
+  
+  ImgTrans --> Output["处理后 sample"]
+  InstAug --> Output
+  Merge --> Output
+```
+
+**归一化数学**（`SingleFieldLinearNormalizer`）：
+
+对于 min-max 模式：
+
+\[
+\hat{x} = \text{clamp}\left(\frac{2(x - x_\min)}{x_\max - x_\min} - 1,\; -5,\; 5\right)
+\]
+
+对于 z-score 模式：
+
+\[
+\hat{x} = \text{clamp}\left(\frac{x - \mu}{\sigma + 10^{-8}},\; -5,\; 5\right)
+\]
+
+clamp 到 \([-5, 5]\) 是防止离群值在混合精度训练中导致数值溢出。
+
+#### 12.4.3 一个训练样本的完整张量流
+
+```mermaid
+flowchart LR
+  subgraph Raw ["原始数据"]
+    R_img["pixel_values\n[2, 33, 3, 512, 512]"]
+    R_act["action\n[32, 7]"]
+    R_sta["state\n[33, 8]"]
+    R_txt["instruction: str"]
+  end
+  
+  subgraph Processed ["处理后"]
+    P_vid["video\n[3, 9, 224, 448]"]
+    P_act["action\n[32, 7]"]
+    P_pro["proprio\n[32, 8]"]
+    P_ctx["context\n[128, 4096]"]
+    P_msk["context_mask\n[128]"]
+    P_apad["action_is_pad\n[32]"]
+    P_ipad["image_is_pad\n[9]"]
+  end
+  
+  subgraph Batched ["DataLoader 批次"]
+    B_vid["video\n[B, 3, 9, 224, 448]"]
+    B_act["action\n[B, 32, 7]"]
+    B_pro["proprio\n[B, 32, 8]"]
+    B_ctx["context\n[B, 128, 4096]"]
+  end
+  
+  R_img -->|"帧采样 + 拼接 + 变换"| P_vid
+  R_act -->|"归一化 + 合并"| P_act
+  R_sta -->|"归一化 → proprio"| P_pro
+  R_txt -->|"SHA256 → 缓存加载"| P_ctx
+  
+  P_vid -->|"collate"| B_vid
+  P_act -->|"collate"| B_act
+  P_pro -->|"collate"| B_pro
+  P_ctx -->|"collate"| B_ctx
+```
+
+---
+
+### 12.5 训练器核心
+
+#### 12.5.1 Trainer 初始化流程
+
+`Wan22Trainer.__init__()`（`trainer.py:29-130`）按顺序完成以下初始化：
+
+```mermaid
+flowchart TB
+  subgraph Step1 ["1. 配置提取"]
+    Cfg["cfg → lr, wd, bs, epochs,\nlog/save/eval_every,\ngrad_accum, max_grad_norm"]
+  end
+  
+  subgraph Step2 ["2. Accelerator"]
+    Acc["Accelerator(\n  gradient_accumulation_steps,\n  mixed_precision='bf16',\n  step_scheduler_with_optimizer=False\n)"]
+  end
+  
+  subgraph Step3 ["3. 模型冻结"]
+    Freeze["model.eval() → 全部冻结\nmodel.dit.train() → MoT 解冻\nproprio_encoder.train() → 解冻"]
+  end
+  
+  subgraph Step4 ["4. 优化器"]
+    Optim["AdamW(\n  params = dit + proprio_encoder,\n  lr = 1e-4,\n  weight_decay = 1e-2,\n  betas = (0.9, 0.95)\n)"]
+  end
+  
+  subgraph Step5 ["5. 数据加载器"]
+    DL["DataLoader(\n  sampler = ResumableEpochSampler,\n  batch_size, num_workers,\n  pin_memory = True\n)"]
+  end
+  
+  subgraph Step6 ["6. 学习率调度"]
+    LR["5% warmup: LinearLR(1/T → 1)\n↓\n95% cosine: CosineAnnealingLR(\n  eta_min = lr × 0.01\n)"]
+  end
+  
+  subgraph Step7 ["7. 分布式包装"]
+    Prep["accelerator.prepare(\n  model, optimizer,\n  dataloader, scheduler\n)\n→ DDP/DeepSpeed 包装"]
+  end
+  
+  Cfg --> Acc --> Step3 --> Optim --> DL --> LR --> Prep
+```
+
+#### 12.5.2 冻结策略——只训练 MoT
+
+```python
+# trainer.py:_apply_dit_only_train_mode() (L287-295)
+model.eval()                      # 所有层设为 eval 模式
+model.requires_grad_(False)       # 所有参数冻结
+model.dit.train()                 # MoT (包含 video+action DiT) 解冻为训练模式
+model.dit.requires_grad_(True)    # MoT 梯度开启
+# proprio_encoder 如果存在，也单独解冻
+```
+
+**效果**：VAE（编码/解码）和 T5（文本编码）的参数**完全冻结**，它们只做前向传播。只有 MoT 内的参数（Video DiT 30层 + Action DiT 30层 + 各自的 embedding/head）参与梯度更新。
+
+**类比**：这类似于 LoRA fine-tuning 的理念——保持预训练骨干不动，只训练新引入的交互层。但 FastWAM 更激进：整个 DiT 参数（包括预训练权重）都会更新，只是 VAE/T5 不动。
+
+#### 12.5.3 学习率调度
+
+\[
+\eta(t) = \begin{cases}
+\eta_\max \cdot \frac{t}{T_w} & 0 \leq t < T_w \quad \text{(线性热身)} \\[6pt]
+\eta_\min + \frac{\eta_\max - \eta_\min}{2}\left(1 + \cos\frac{\pi(t - T_w)}{T - T_w}\right) & T_w \leq t < T \quad \text{(余弦衰减)}
+\end{cases}
+\]
+
+其中 \(T_w = 0.05 \times T\)（5% 热身），\(\eta_\min = 0.01 \times \eta_\max\)。
+
+**对于 LIBERO 的典型参数**：
+- 总步数 \(T\) ≈ 20000（10 epochs × ~2000 steps/epoch）
+- 热身 \(T_w\) = 1000 步
+- \(\eta_\max = 10^{-4}\)，\(\eta_\min = 10^{-6}\)
+
+#### 12.5.4 主训练循环
+
+```mermaid
+sequenceDiagram
+    participant Sampler as ResumableEpochSampler
+    participant DL as DataLoader
+    participant Model as FastWAM
+    participant Acc as Accelerator
+    participant Opt as AdamW
+    participant Sched as CosineAnnealingLR
+    participant Log as W&B / Console
+    
+    loop while global_step < max_steps
+        DL->>Sampler: next batch indices
+        Sampler-->>DL: shuffled indices (epoch-seeded)
+        DL-->>Model: sample batch
+        
+        Note over Acc: accumulate context (梯度累积)
+        
+        rect rgb(240, 248, 255)
+            Note over Model: 前向传播
+            Model->>Model: training_loss(sample)
+            Model-->>Acc: loss, loss_dict
+            
+            Note over Acc: 反向传播
+            Acc->>Acc: backward(loss)
+        end
+        
+        alt sync_gradients == true (累积完成)
+            Acc->>Acc: clip_grad_norm_(max=1.0)
+            Acc->>Opt: step()
+            Opt->>Sched: step() (if not skipped)
+            Opt->>Opt: zero_grad(set_to_none=True)
+            Note over Model: global_step += 1
+        end
+        
+        alt global_step % log_every == 0
+            Model-->>Log: loss, grad_norm, lr, speed
+        end
+        
+        alt global_step % eval_every == 0
+            Model->>Model: evaluate()
+            Model-->>Log: val_loss, PSNR, SSIM, action_L1/L2
+        end
+        
+        alt global_step % save_every == 0
+            Model->>Model: save_checkpoint()
+            Note over Model: weights + state + trainer_state.json
+        end
+    end
+```
+
+**梯度累积机制**（`accelerator.accumulate(model)` 上下文管理器）：
+
+当 `gradient_accumulation_steps=N` 时：
+- 前 N-1 次前向/反向：梯度**累加**但不同步跨 GPU，不执行 optimizer.step
+- 第 N 次：`sync_gradients=True`，触发 all-reduce 梯度同步 + optimizer.step
+- 等效批大小 = `batch_size × N × num_GPUs`
+
+#### 12.5.5 评估流程
+
+`evaluate()`（`trainer.py:376-565`）在每个 eval 间隔执行：
+
+1. 从验证集随机取 1 个样本
+2. 计算**验证损失**（与训练相同的 `training_loss()`）
+3. 执行**推理**：`model.infer()` 生成视频 + 动作
+4. 计算**视频指标**：
+   - 预测 vs GT：PSNR, SSIM
+   - VAE重建 vs GT：PSNR, SSIM（衡量 VAE 信息损失上界）
+   - 预测 vs VAE重建：PSNR, SSIM（衡量去噪质量）
+5. 计算**动作指标**：反归一化后的 L1 和 L2 误差
+6. 生成**可视化视频**：水平拼接 [预测 | VAE重建 | GT]，保存为 MP4
+7. 跨 GPU 聚合所有指标
+
+---
+
+### 12.6 模型前向传播——training_loss() 的完整生命周期
+
+#### 12.6.1 build_inputs()：从样本到模型输入
+
+`fastwam.py:build_inputs()`（L277-383）完成原始训练样本到模型可消费格式的转换：
+
+```mermaid
+flowchart TB
+  Sample["训练 sample\n{video, action, proprio,\ncontext, context_mask, ...}"]
+  
+  Sample --> VideoEnc["VAE.encode(video)\n[B,3,9,224,448] → [B,48,3,28,56]"]
+  VideoEnc --> FirstFrame["提取首帧 latent\nfirst_frame_latents [B,48,1,28,56]"]
+  VideoEnc --> AllLatents["input_latents [B,48,3,28,56]"]
+  
+  Sample --> CtxMove["context → device, dtype\n[B, 128, 4096]"]
+  Sample --> ProprioEnc["proprio_encoder(proprio[:,0,:])\n[B, 8] → Linear → [B, 1, 4096]"]
+  CtxMove --> CtxConcat["context = cat([context, proprio_token])\n[B, 129, 4096]"]
+  ProprioEnc --> CtxConcat
+  
+  Sample --> ActMove["action → device, dtype\n[B, 32, 7]"]
+```
+
+**VAE 编码的张量变化**（以 LIBERO 224×448 为例）：
+
+\[
+\underbrace{[B, 3, 9, 224, 448]}_{\text{原始视频}} \xrightarrow{\text{VAE}} \underbrace{[B, 48, 3, 28, 56]}_{\text{latent 视频}}
+\]
+
+时间维：\((9-1)/4 + 1 = 3\) 个 latent 帧；空间维：\(224/8 = 28\)，\(448/8 = 56\)
+
+#### 12.6.2 噪声采样——两条独立的 Flow Matching 路径
+
+```mermaid
+flowchart LR
+  subgraph VideoNoise ["视频噪声路径"]
+    uv["u_v ~ U(0,1)"]
+    uv --> phiv["σ_v = φ(u_v, 5.0)"]
+    phiv --> tv["t_v = σ_v × 1000"]
+    
+    epv["ε_v ~ N(0,I)\n[B,48,3,28,56]"]
+    
+    tv --> addv["latents_v = (1-σ_v)·z₀ + σ_v·ε_v"]
+    epv --> addv
+    addv --> targetv["target_v = ε_v - z₀"]
+    addv --> freezev["latents_v[:,:,0:1] = first_frame\n（首帧替换为干净 latent）"]
+  end
+  
+  subgraph ActionNoise ["动作噪声路径"]
+    ua["u_a ~ U(0,1)"]
+    ua --> phia["σ_a = φ(u_a, 5.0)"]
+    phia --> ta["t_a = σ_a × 1000"]
+    
+    epa["ε_a ~ N(0,I)\n[B,32,7]"]
+    
+    ta --> adda["action_t = (1-σ_a)·a₀ + σ_a·ε_a"]
+    epa --> adda
+    adda --> targeta["target_a = ε_a - a₀"]
+  end
+```
+
+**关键设计**：视频和动作的噪声 \(\epsilon\) 和时间步 \(t\) 是**完全独立采样**的。这意味着在同一个训练样本中，视频可能处于"几乎纯噪声"状态，而动作处于"几乎干净"状态——反之亦然。这种解耦增加了训练信号的多样性。
+
+#### 12.6.3 Video Expert pre_dit()：Patchify + 分离时间步 + 3D RoPE
+
+`wan_video_dit.py:pre_dit()`（L509-620）将 VAE latent 转化为 DiT 可处理的 token 序列：
+
+```mermaid
+flowchart TB
+  Latents["noisy_latents\n[B, 48, 3, 28, 56]"]
+  
+  Latents --> Patch["Conv3d Patchify\nkernel=[1,2,2], stride=[1,2,2]\n48 → 3072"]
+  Patch --> PatchOut["[B, 3072, 3, 14, 28]"]
+  PatchOut --> Flatten["rearrange → [B, 1176, 3072]\nseq_len = 3×14×28 = 1176"]
+  
+  subgraph TimestepEmbed ["分离时间步嵌入"]
+    T_input["timestep [B]"]
+    T_input --> TokenT["构造 per-token timestep\n首帧: t=0, 后续帧: t=t_sampled\n[B, 3, 392] → flatten [B×1176]"]
+    TokenT --> SinEmb["sinusoidal_embedding_1d\n→ [B×1176, 256]"]
+    SinEmb --> TimeMLP["time_embedding (MLP)\n→ [B×1176, 3072]"]
+    TimeMLP --> TimeProj["time_projection\n→ [B, 1176, 6, 3072]\n6 个 AdaLN 调制参数"]
+  end
+  
+  subgraph RoPE ["3D RoPE 频率"]
+    Coords["3D 坐标 (f, h, w)\n每个 token 的帧/高/宽位置"]
+    Coords --> FreqsCat["freqs = cat[RoPE_f, RoPE_h, RoPE_w]\n[1176, 1, 128]"]
+  end
+  
+  subgraph TextEmb ["文本嵌入"]
+    Ctx["context [B, 129, 4096]"]
+    Ctx --> TextProj["Linear(4096 → 3072)\n→ [B, 129, 3072]"]
+  end
+```
+
+**tokens_per_frame 计算**（以 LIBERO 为例）：
+
+\[
+\text{tokens\_per\_frame} = \frac{28}{2} \times \frac{56}{2} = 14 \times 28 = 392
+\]
+
+总序列长度 \(S_v = 3 \times 392 = 1176\)。
+
+#### 12.6.4 Action Expert pre_dit()
+
+`action_dit.py:pre_dit()`（L226-299）处理动作序列：
+
+| 步骤 | 操作 | 输入 → 输出 |
+|------|------|------------|
+| 动作编码 | `nn.Linear(7 → 1024)` | [B, 32, 7] → [B, 32, 1024] |
+| 时间步嵌入 | `sinusoidal → MLP` | [B] → [B, 1024] → t_mod [B, 6, 1024] |
+| 文本嵌入 | `nn.Sequential(4096→1024→GELU→1024)` | [B, 129, 4096] → [B, 129, 1024] |
+| 1D RoPE | `precompute_freqs_cis` | → [32, 1, 128] |
+
+**与 Video Expert 的对比**：
+- 时间步嵌入是**全序列共享**的（[B, 6, 1024]），不是 per-token 的——因为所有动作 token 处于同一噪声水平
+- RoPE 是**一维**的（只有时间维），不是三维的
+
+#### 12.6.5 MoT.forward()：逐层混合注意力
+
+MoT 的核心是在**每一层**都将两个专家的 token 序列拼接做一次联合 Flash Attention，然后拆回各自分支做独立的 cross-attention 和 FFN。
+
+```mermaid
+sequenceDiagram
+    participant V as Video Expert Layer i
+    participant A as Action Expert Layer i
+    participant MoT as Mixed Attention
+    participant VPost as Video Post-Block
+    participant APost as Action Post-Block
+    
+    Note over V,A: === 第 i 层（共 30 层）===
+    
+    rect rgb(255, 245, 238)
+        Note over V,A: 1. 各自独立的 Pre-Attention
+        V->>V: AdaLN(norm1, t_mod_v) → modulated_v
+        V->>V: Q_v = RoPE(norm_q(q_proj(modulated_v)))
+        V->>V: K_v = RoPE(norm_k(k_proj(modulated_v)))
+        V->>V: V_v = v_proj(modulated_v)
+        Note over V: [B, 1176, 3072] each
+        
+        A->>A: AdaLN(norm1, t_mod_a) → modulated_a
+        A->>A: Q_a = RoPE(norm_q(q_proj(modulated_a)))
+        A->>A: K_a = RoPE(norm_k(k_proj(modulated_a)))
+        A->>A: V_a = v_proj(modulated_a)
+        Note over A: [B, 32, 3072] each
+    end
+    
+    rect rgb(240, 248, 255)
+        Note over MoT: 2. 拼接 + Flash Attention
+        V->>MoT: Q_v, K_v, V_v
+        A->>MoT: Q_a, K_a, V_a
+        MoT->>MoT: Q = [Q_v; Q_a] → [B, 1208, 3072]
+        MoT->>MoT: K = [K_v; K_a] → [B, 1208, 3072]
+        MoT->>MoT: V = [V_v; V_a] → [B, 1208, 3072]
+        MoT->>MoT: FlashAttn(Q, K, V, mask[1208,1208])
+        MoT->>MoT: split → out_v[B,1176,3072], out_a[B,32,3072]
+    end
+    
+    rect rgb(245, 255, 245)
+        Note over VPost,APost: 3. 各自独立的 Post-Attention
+        MoT->>VPost: out_v
+        VPost->>VPost: x_v = gate_msa ⊙ o_proj(out_v) + residual_v
+        VPost->>VPost: x_v += cross_attn(norm3(x_v), T5_context)
+        VPost->>VPost: x_v += gate_mlp ⊙ FFN(AdaLN(norm2(x_v)))
+        Note over VPost: FFN: 3072→14336→GELU→3072
+        
+        MoT->>APost: out_a
+        APost->>APost: x_a = gate_msa ⊙ o_proj(out_a) + residual_a
+        APost->>APost: x_a += cross_attn(norm3(x_a), T5_context)
+        APost->>APost: x_a += gate_mlp ⊙ FFN(AdaLN(norm2(x_a)))
+        Note over APost: FFN: 1024→4096→GELU→1024
+    end
+```
+
+**一层的计算量分析**：
+
+混合注意力矩阵大小：\((S_v + S_a) \times (S_v + S_a) = 1208 \times 1208 \approx 1.46\text{M}\) 个元素。
+
+但由于结构化掩码，实际有效计算量更小——被 mask 掉的位置在 Flash Attention 中跳过。
+
+#### 12.6.6 post_dit()：从 token 回到预测
+
+**Video Expert**（`wan_video_dit.py:post_dit`）：
+
+\[
+\underbrace{[B, 1176, 3072]}_{\text{token}} \xrightarrow{\text{Head}} [B, 1176, 48 \times 1 \times 2 \times 2] = [B, 1176, 192] \xrightarrow{\text{unpatchify}} \underbrace{[B, 48, 3, 28, 56]}_{\text{latent}}
+\]
+
+Head 包含 AdaLN 调制（使用时间步嵌入 `t`）+ Linear 投影。
+
+**Action Expert**（`action_dit.py:post_dit`）：
+
+\[
+\underbrace{[B, 32, 1024]}_{\text{token}} \xrightarrow{\text{Linear}} \underbrace{[B, 32, 7]}_{\text{predicted noise}}
+\]
+
+直接一层线性投影，简洁明了。
+
+#### 12.6.7 损失计算的完整数学
+
+**完整损失函数**：
+
+\[
+\mathcal{L} = \lambda_v \cdot \mathcal{L}_\text{vid} + \lambda_a \cdot \mathcal{L}_\text{act}
+\]
+
+**视频损失**（含 padding 掩码）：
+
+\[
+\mathcal{L}_\text{vid} = \frac{1}{B} \sum_{i=1}^{B} \tilde{w}(t_i^v) \cdot \frac{\sum_{j=1}^{T_z} \mathbb{1}[\text{valid}_j^i] \cdot \frac{1}{C \cdot H_z \cdot W_z} \| \hat{v}_{i,j} - (\epsilon_{i,j}^v - z_{i,j}^0) \|_F^2}{\sum_{j=1}^{T_z} \mathbb{1}[\text{valid}_j^i]}
+\]
+
+其中 \(\mathbb{1}[\text{valid}_j^i] = 1 - \text{image\_is\_pad}[i, j]\)，padding 位置不参与损失。
+
+**动作损失**：
+
+\[
+\mathcal{L}_\text{act} = \frac{1}{B} \sum_{i=1}^{B} \tilde{w}(t_i^a) \cdot \frac{\sum_{k=1}^{H} \mathbb{1}[\text{valid}_k^i] \cdot \frac{1}{d_a} \| \hat{a}_{i,k} - (\epsilon_{i,k}^a - a_{i,k}^0) \|^2}{\sum_{k=1}^{H} \mathbb{1}[\text{valid}_k^i]}
+\]
+
+**训练权重**（来自 `scheduler_continuous.py:training_weight`）：
+
+\[
+\tilde{w}(t) = \frac{\exp\left(-2\left(\frac{t - T/2}{T}\right)^2\right) - w_\min}{\bar{w} + \epsilon}
+\]
+
+这个高斯权重让模型**更关注中等噪声水平的样本**——这些样本包含最有区分度的训练信号。
+
+---
+
+### 12.7 完整类图
+
+```mermaid
+classDiagram
+    class Wan22Trainer {
+        -model: FastWAM
+        -accelerator: Accelerator
+        -optimizer: AdamW
+        -scheduler: SequentialLR
+        -train_loader: DataLoader
+        -global_step: int
+        +train()
+        +evaluate() → dict
+        +save_checkpoint()
+        +load_training_state()
+        -_build_scheduler()
+        -_apply_dit_only_train_mode()
+        -_estimate_eta()
+    }
+    
+    class FastWAM {
+        +video_expert: WanVideoDiT
+        +action_expert: ActionDiT
+        +mot: MoT
+        +vae: WanVideoVAE
+        +proprio_encoder: Linear
+        +train_video_scheduler: FlowMatchScheduler
+        +train_action_scheduler: FlowMatchScheduler
+        +training_loss(sample) → loss, dict
+        +build_inputs(sample) → dict
+        +save_checkpoint(path)
+    }
+    
+    class WanVideoDiT {
+        +patch_embedding: Conv3d
+        +blocks: ModuleList~DiTBlock~
+        +head: Head
+        +text_embedding: Linear
+        +time_embedding: Sequential
+        +pre_dit(x, t, ctx) → dict
+        +post_dit(tokens, state) → Tensor
+        +build_video_to_video_mask()
+    }
+    
+    class ActionDiT {
+        +action_encoder: Linear
+        +blocks: ModuleList~DiTBlock~
+        +head: Linear
+        +text_embedding: Sequential
+        +time_embedding: Sequential
+        +pre_dit(tokens, t, ctx) → dict
+        +post_dit(tokens, state) → Tensor
+    }
+    
+    class MoT {
+        +mixtures: ModuleDict
+        +num_layers: int
+        +forward(embeds, mask, freqs, ctx, t_mod) → dict
+        +prefill_video_cache() → list
+        +forward_action_with_video_cache()
+        -_mixed_attention(q, k, v, mask)
+        -_build_expert_attention_io()
+        -_apply_expert_post_block()
+    }
+    
+    class DiTBlock {
+        +self_attn: SelfAttention
+        +cross_attn: CrossAttention
+        +ffn: Sequential
+        +norm1, norm2, norm3: LayerNorm
+        +modulation: Parameter
+        +gate: GateModule
+    }
+    
+    class FlowMatchScheduler {
+        +shift: float
+        +num_train_timesteps: int
+        +sample_training_t(B) → Tensor
+        +add_noise(x, ε, t) → Tensor
+        +training_target(x, ε, t) → Tensor
+        +training_weight(t) → Tensor
+        +step(pred, δ, x) → Tensor
+    }
+    
+    class RobotVideoDataset {
+        -lerobot_dataset: BaseLerobotDataset
+        -processor: FastWAMProcessor
+        -video_sample_indices: list
+        +__getitem__(idx) → dict
+        -_get_cached_text_context()
+    }
+    
+    class FastWAMProcessor {
+        -normalizer: LinearNormalizer
+        -action_state_merger: ConcatLeftAlign
+        -delta_action_dim_mask: dict
+        +preprocess(sample) → dict
+        +augment_instruction(data) → str
+        +set_normalizer_from_stats()
+    }
+    
+    class ResumableEpochSampler {
+        -seed: int
+        -epoch: int
+        -resume_batch_offset: int
+        +__iter__() → Iterator
+        +set_epoch_offset()
+        +set_resume_batch_offset()
+    }
+    
+    Wan22Trainer --> FastWAM : trains
+    Wan22Trainer --> RobotVideoDataset : loads data
+    Wan22Trainer --> ResumableEpochSampler : samples
+    FastWAM *-- WanVideoDiT : video_expert
+    FastWAM *-- ActionDiT : action_expert
+    FastWAM *-- MoT : mot
+    FastWAM *-- FlowMatchScheduler : schedulers
+    MoT o-- WanVideoDiT : mixtures["video"]
+    MoT o-- ActionDiT : mixtures["action"]
+    WanVideoDiT *-- DiTBlock : blocks × 30
+    ActionDiT *-- DiTBlock : blocks × 30
+    RobotVideoDataset --> FastWAMProcessor : processor
+```
+
+---
+
+### 12.8 预处理脚本
+
+#### 12.8.1 ActionDiT 骨干预处理——从 5B 到 1B 的智慧压缩
+
+`scripts/preprocess_action_dit_backbone.py` 通过**线性插值 + alpha scaling** 从 Wan2.2 的 5B Video DiT 初始化 1B Action DiT：
+
+```mermaid
+flowchart LR
+  WanDiT["Wan2.2 Video DiT\nhidden=3072, ffn=14336\n每层权重矩阵"] --> Extract["提取 backbone keys\n(跳过 action_encoder, head)"]
+  Extract --> Check{shape 匹配?}
+  Check -->|"Yes"| Copy["直接复制\n(e.g. bias, 1D params)"]
+  Check -->|"No"| Interp["线性插值\n_resize_tensor_to_shape()\n3072→1024, 14336→4096"]
+  Interp --> Alpha{"alpha scaling?"}
+  Alpha -->|"Yes"| Scale["value × √(d_src/d_dst)\n= × √(3072/1024) ≈ ×1.73"]
+  Alpha -->|"No"| NoScale["原样"]
+  Copy --> Save["保存 .pt 文件\n{backbone_state_dict, meta, policy}"]
+  Scale --> Save
+  NoScale --> Save
+```
+
+**Alpha scaling 的数学原理**：
+
+当将宽度为 \(d_\text{src}\) 的权重矩阵插值到 \(d_\text{dst}\) 时，为保持输出方差不变（类似 Xavier 初始化的思想），需要乘以：
+
+\[
+\alpha = \sqrt{\frac{d_\text{src}}{d_\text{dst}}}
+\]
+
+这确保了 Action DiT 初始化后的激活分布与 Video DiT 类似，有利于训练稳定性。
+
+#### 12.8.2 T5 嵌入预计算
+
+`scripts/precompute_text_embeds.py` 为所有训练任务的文本指令预计算 T5 嵌入：
+
+1. 收集所有数据集目录中的唯一指令
+2. 对每个指令：`prompt → SHA256 hash → cache_path`
+3. 批量通过 T5 编码：`text → tokenize → T5 forward → [L, 4096]`
+4. 原子写入缓存文件（临时文件 + rename，避免并发写入损坏）
+
+文件名格式：`{sha256_hash}.t5_len128.wan22ti2v5b.pt`
+
+---
+
+### 12.9 分布式训练与检查点
+
+#### 12.9.1 DeepSpeed ZeRO-1 集成
+
+```mermaid
+flowchart TB
+  subgraph GPU0 ["GPU 0"]
+    M0["完整模型参数"]
+    G0["完整梯度"]
+    O0["优化器状态 1/N\n(分片)"]
+  end
+  
+  subgraph GPU1 ["GPU 1"]
+    M1["完整模型参数"]
+    G1["完整梯度"]
+    O1["优化器状态 2/N\n(分片)"]
+  end
+  
+  subgraph GPUn ["GPU N"]
+    Mn["完整模型参数"]
+    Gn["完整梯度"]
+    On["优化器状态 N/N\n(分片)"]
+  end
+  
+  G0 <-->|"All-Reduce\n梯度同步"| G1
+  G1 <-->|"All-Reduce"| Gn
+```
+
+**ZeRO-1 的核心思想**：每个 GPU 保留完整的模型参数和梯度副本（用于计算），但**优化器状态**（AdamW 的一阶/二阶矩估计）被**均匀分片**到所有 GPU。
+
+对 6B 参数的 FastWAM：
+- 模型参数：~12 GB（bf16）
+- 优化器状态（fp32）：~48 GB → 分片后每 GPU ~6 GB（8 GPU）
+- 显存节约：约 42 GB / GPU
+
+#### 12.9.2 检查点三部件
+
+每次 `save_checkpoint()`（`trainer.py:583-599`）保存三部分：
+
+| 部件 | 路径 | 内容 | 保存者 |
+|------|------|------|--------|
+| **权重** | `checkpoints/weights/step_*.pt` | MoT 参数 + proprio_encoder | 仅主进程 |
+| **训练状态** | `checkpoints/state/step_*/` | 优化器 + 调度器 + RNG 状态 | Accelerator (全部进程) |
+| **Trainer 状态** | `checkpoints/state/step_*/trainer_state.json` | global_step, epoch, batch_in_epoch | 仅主进程 |
+
+**恢复流程**（`load_training_state()`，L601-644）：
+
+```mermaid
+flowchart TB
+  Resume["resume 参数"]
+  Resume -->|"是目录"| LoadFull["完整恢复\naccelerator.load_state(dir)\n+ trainer_state.json"]
+  Resume -->|"是文件"| LoadWeights["仅加载权重\nmodel.load_checkpoint(file)"]
+  Resume -->|"False"| Skip["跳过恢复"]
+  
+  LoadFull --> RestoreStep["global_step = saved_step"]
+  LoadFull --> RestoreEpoch["epoch = saved_epoch"]
+  LoadFull --> RestoreBatch["sampler.set_resume_batch_offset(batch_in_epoch)"]
+  
+  RestoreBatch --> Continue["从断点继续训练\n跳过已处理的 batch"]
+```
+
+`ResumableEpochSampler` 的恢复机制确保了**精确断点续训**：通过 `set_resume_batch_offset(batch_in_epoch)` 跳过当前 epoch 中已处理的 batch，从中断的精确位置继续。
+
+---
+
+### 12.10 端到端时间线：一个训练 step 的生命周期
+
+以 LIBERO 配置（batch_size=16, 8 GPU, bf16）为例，一个完整训练 step 的时间线：
+
+```mermaid
+gantt
+    title 一个训练 step 的时间分解（估算）
+    dateFormat X
+    axisFormat %s ms
+    
+    section 数据加载
+    DataLoader fetch + preprocess :d1, 0, 50
+    
+    section 前向传播
+    VAE encode (frozen)           :f1, 50, 70
+    Noise sampling + add_noise    :f2, 70, 72
+    Video pre_dit (patch+embed)   :f3, 72, 80
+    Action pre_dit (embed)        :f4, 80, 82
+    MoT 30 layers mixed-attn     :f5, 82, 250
+    post_dit (head + unpatch)     :f6, 250, 260
+    Loss computation              :f7, 260, 265
+    
+    section 反向传播
+    backward through MoT          :b1, 265, 500
+    
+    section 优化器
+    All-Reduce gradients           :o1, 500, 520
+    Gradient clipping              :o2, 520, 525
+    AdamW step                     :o3, 525, 540
+    LR scheduler step              :o4, 540, 542
+```
+
+**粗略估算**：
+- 前向传播：~215 ms（MoT 占 ~170 ms，即 ~80%）
+- 反向传播：~235 ms（约为前向的 1.1×，因为梯度检查点会重算部分前向）
+- 通信 + 优化器：~42 ms
+- **总计**：~500 ms / step
+
+对于 20000 步训练（LIBERO）：~2.8 小时（8× H100 GPU）。

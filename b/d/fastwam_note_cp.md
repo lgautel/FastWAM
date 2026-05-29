@@ -18,6 +18,7 @@
 9. [参考文献](#9-参考文献)
 10. [训练数据格式与处理流水线](#10-训练数据格式与处理流水线)
 11. [论文内容与本地实现对照](#11-论文内容与本地实现对照)
+12. [训练 Pipeline 全链路解析](#12-训练-pipeline-全链路解析)
 
 ---
 
@@ -1357,6 +1358,578 @@ RoboTwin 可设 `max_steps=30000`；多卡规模见 README（论文 64 GPU，本
 **未开源或需自行配置**的主要是：真机实验、官方延迟脚本、现成的 no-co-train task（可用 `lambda_video=0` 补上）。**易混淆点**：`model.infer()` 等价于慢的 `infer_joint`，而论文结论与部署依赖 `infer_action`；训练 `evaluate()` 亦走 joint 路径，监控指标不代表部署延迟。
 
 阅读代码时建议路径：**`runtime.create_fastwam` → `FastWAM.training_loss` / `infer_action` → `experiments/*/eval_*` 或 `deploy_policy.py`**，并对照本章总表核对论文每一项是否覆盖。
+
+---
+
+## 12. 训练 Pipeline 全链路解析
+
+本章专门拆解 **从 shell 命令到一次 `optimizer.step()`** 的完整训练链路：涉及哪些文件、谁调用谁、张量如何流动、哪些参数在更新。第 5 章给复现命令，第 10 章讲单样本数据，第 11 章对照论文；此处聚焦 **训练工程与 `training_loss` 内核**。
+
+### 12.1 鸟瞰：从命令到一次参数更新
+
+典型启动命令：
+
+```bash
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 max_steps=20000
+```
+
+端到端调用链：
+
+```text
+train_zero1.sh
+  → accelerate launch (DeepSpeed ZeRO-1, N GPU)
+      → scripts/train.py  [@hydra: configs/train.yaml + task override]
+          → runtime.run_training(cfg)
+              → instantiate(cfg.model)     # FastWAM
+              → build_datasets(cfg.data) # RobotVideoDataset
+              → Wan22Trainer(...).train()
+                  → loop: training_loss(batch) → backward → clip → step
+```
+
+训练产物目录（由 shell 注入 `output_dir`）：
+
+```text
+runs/<task_basename>/<RUN_ID>/
+├── config.yaml              # 解析后的完整 Hydra 配置
+├── dataset_stats.json       # 归一化统计（主进程写出）
+├── checkpoints/
+│   ├── weights/step_XXXXXX.pt   # 仅 MoT + proprio_encoder 权重
+│   └── state/step_XXXXXX/       # Accelerate 全状态 + trainer_state.json
+└── eval/                    # evaluate() 保存的拼接视频等
+```
+
+```mermaid
+flowchart TB
+  Shell[train_zero1.sh] --> Accel[accelerate launch ZeRO1]
+  Accel --> TrainPy[scripts/train.py]
+  TrainPy --> RT[runtime.run_training]
+  RT --> InstM[instantiate model]
+  RT --> InstD[build_datasets]
+  RT --> Trainer[Wan22Trainer.train]
+  InstM --> FW[FastWAM]
+  InstD --> RVD[RobotVideoDataset]
+  Trainer --> Loss[training_loss]
+  Loss --> BW[backward + optimizer.step]
+```
+
+---
+
+### 12.2 配置装配：Hydra 如何拼出一次实验
+
+#### 12.2.1 三层 defaults
+
+根配置 [`configs/train.yaml`](../../configs/train.yaml) 声明：
+
+```yaml
+defaults:
+  - data: null
+  - model: null
+  - task: null
+```
+
+启动时必须指定 `task=libero_uncond_2cam224_1e-4` 等；task 文件再 **override** data 与 model：
+
+```mermaid
+flowchart LR
+  trainYaml[train.yaml] --> taskYaml[task/*.yaml]
+  taskYaml --> dataYaml[data/libero_2cam.yaml]
+  taskYaml --> modelYaml[model/fastwam.yaml]
+  taskYaml --> hyper[lr batch_size num_epochs save_every]
+```
+
+以 [`configs/task/libero_uncond_2cam224_1e-4.yaml`](../../configs/task/libero_uncond_2cam224_1e-4.yaml) 为例：
+
+| 覆盖项 | 典型值 | 作用 |
+|--------|--------|------|
+| `batch_size` | 16 | 每卡 micro-batch |
+| `learning_rate` | 1e-4 | AdamW |
+| `weight_decay` | 1e-2 | 对齐论文 0.01 |
+| `num_epochs` | 10 | 与 `max_steps` 二选一驱动总步数 |
+| `max_steps` | null（可 CLI 覆盖） | 见 12.2.2 |
+| `save_every` / `eval_every` | 2000 / 200 | checkpoint 与验证频率 |
+| `model.mot_checkpoint_mixed_attn` | false | 混合注意力是否 gradient checkpoint |
+
+`model` 段通过 `${data.train.processor.*}` 解析 action/proprio 维度（[`fastwam.yaml`](../../configs/model/fastwam.yaml)）。
+
+#### 12.2.2 训练步数 `max_steps` 怎么定
+
+`Wan22Trainer.__init__` 中（[`trainer.py`](../../src/fastwam/trainer.py)）：
+
+1. 读取 `cfg.max_steps`（可为 `null`）；
+2. 调用 `_estimate_total_train_steps()`：
+   - 若 `cfg.max_steps` 已设 → 直接用；
+   - 否则  
+     \[
+     $$T_{\mathrm{train}} \approx E \cdot \left\lceil \frac{|D|}{B_{\mathrm{global}} \cdot G_{\mathrm{acc}}} \right\rceil$$
+     \]
+     其中 E= `num_epochs`，$B_{\mathrm{global}} =$ `batch_size × num_processes`，\(G_{\mathrm{acc}}=\) `gradient_accumulation_steps`；
+3. `self.max_steps = total_train_steps`（L97–98）。
+
+主循环是 **`while self.global_step < self.max_steps`**（L659），DataLoader 耗尽则 `epoch += 1` 并重新 `iter(loader)`，**不是**简单的 `for epoch in range(num_epochs): for batch in loader`。
+
+要对齐论文 LIBERO **20k steps**，应显式传：
+
+```bash
+bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 max_steps=20000
+```
+
+#### 12.2.3 `run_training` 入口
+
+```359:381:src/fastwam/runtime.py
+def run_training(cfg: DictConfig):
+    ...
+    misc.register_work_dir(cfg.output_dir)
+    ...  # 写 config.yaml
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    train_ds, val_ds = build_datasets(cfg.data)
+    trainer = Wan22Trainer(cfg=cfg, model=model, train_dataset=train_ds, val_dataset=val_ds)
+    trainer.train()
+```
+
+`instantiate(cfg.model)` 根据 `_target_` 分发到 `create_fastwam` / `create_fastwam_joint` / `create_fastwam_idm`（[`runtime.py`](../../src/fastwam/runtime.py) L76+）。
+
+---
+
+### 12.3 启动层：`train_zero1.sh` 与 Accelerate
+
+[`scripts/train_zero1.sh`](../../scripts/train_zero1.sh) 职责：
+
+1. 解析第一个参数为 `NPROC_PER_NODE`（每机 GPU 数）；
+2. 从 `task=...` 提取 `TASK_BASENAME`，用于 `output_dir` 与 wandb 名；
+3. 多机时通过 `torch.distributed.TCPStore` 同步 `RUN_ID`；
+4. 调用：
+
+```bash
+accelerate launch \
+  --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
+  --num_processes "${NPROC_PER_NODE}" \
+  scripts/train.py \
+  "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
+  "wandb.name=${TASK_BASENAME}" \
+  "${EXTRA_ARGS[@]}"
+```
+
+Accelerate 使用 **DeepSpeed ZeRO-1**（[`accelerate_zero1_ds.yaml`](../../scripts/accelerate_configs/accelerate_zero1_ds.yaml) → `scripts/ds_configs/ds_zero1_config.json`），优化器状态分片；**混合精度**由 `train.yaml` 的 `mixed_precision: bf16` 传入 `Accelerator(mixed_precision=...)`，与 DS json 中 `mixed_precision: null` 分工明确。
+
+旁征博引：这与 Hugging Face **Accelerate** 的常见模式一致——launcher 管进程与 DeepSpeed，Trainer 管 `autocast` 与 `backward`。
+
+---
+
+### 12.4 训练前依赖（Pipeline 前置门）
+
+在进入 `run_training` 之前，需完成（详见第 5、10 章）：
+
+| 步骤 | 脚本 | 产出 |
+|------|------|------|
+| ActionDiT 骨干 | `preprocess_action_dit_backbone.py` | `checkpoints/ActionDiT_....pt` |
+| T5 文本缓存 | `precompute_text_embeds.py` | `data/text_embeds_cache/<task>/` |
+| 数据 | HF 下载 + 解压 | `data/libero_*` 或 `data/robotwin2.0` |
+
+缺 T5 缓存时，`RobotVideoDataset._get_cached_text_context` 会 `FileNotFoundError`，训练无法启动。
+
+---
+
+### 12.5 模型初始化与可训练参数
+
+#### 12.5.1 `FastWAM.from_wan22_pretrained`
+
+```120:150:src/fastwam/models/wan22/fastwam.py
+        components = load_wan22_ti2v_5b_components(...)
+        video_expert = components.dit
+        action_expert = ActionDiT.from_pretrained(...)
+        ...
+        mot = MoT(mixtures={"video": video_expert, "action": action_expert}, ...)
+```
+
+组装结果：
+
+- **video_expert**：Wan2.2-TI2V-5B DiT 权重（Hugging Face / 本地 `checkpoints`）；
+- **action_expert**：结构同 DiT、hidden 1024，权重来自 Wan 线性插值 ckpt；
+- **mot**：持有两个专家的 `blocks`，`model.dit = mot`（与 DiffSynth 习惯一致，Trainer 只优化 `model.dit`）；
+- **vae**：冻结，用于 `build_inputs` 里 encode video；
+- **text_encoder**：训练配置 `load_text_encoder: false`，文本来自数据集预计算 `context`。
+
+#### 12.5.2 冻结策略：只训 MoT（+ proprio）
+
+```287:295:src/fastwam/trainer.py
+    def _apply_dit_only_train_mode(model):
+        model.eval()
+        model.requires_grad_(False)
+        model.dit.train()
+        model.dit.requires_grad_(True)
+        proprio_encoder = getattr(model, "proprio_encoder", None)
+        if proprio_encoder is not None:
+            proprio_encoder.train()
+            proprio_encoder.requires_grad_(True)
+```
+
+含义：
+
+- VAE、Wan/Action 专家中**未纳入 MoT 梯度路径外的参数**保持 `eval` 且无梯度；
+- 实际更新的是 **MoT 内混合注意力 + 各专家 cross-attn/FFN** 中 `requires_grad=True` 的部分，以及把 proprio 映射到 text 维的 `Linear`。
+
+Optimizer 构造时（L85–94）：
+
+```python
+trainable_params = list(self.model.dit.parameters())
+# + proprio_encoder.parameters() if exists
+```
+
+#### 12.5.3 核心类关系（UML classDiagram）
+
+```mermaid
+classDiagram
+  class Wan22Trainer {
+    +train()
+    +evaluate()
+    +save_checkpoint()
+    -accelerator Accelerator
+    -train_loader DataLoader
+  }
+
+  class FastWAM {
+    +training_loss(sample)
+    +build_inputs(sample)
+    +infer_action(...)
+    +dit MoT
+    +video_expert WanVideoDiT
+    +action_expert ActionDiT
+    +vae
+    +proprio_encoder Linear
+  }
+
+  class MoT {
+    +forward(embeds_all, mask)
+    +prefill_video_cache(...)
+    +forward_action_with_video_cache(...)
+  }
+
+  class WanVideoDiT {
+    +pre_dit()
+    +post_dit()
+    +build_video_to_video_mask()
+  }
+
+  class ActionDiT {
+    +pre_dit()
+    +post_dit()
+  }
+
+  class RobotVideoDataset {
+    +__getitem__()
+  }
+
+  class FastWAMProcessor {
+    +preprocess()
+  }
+
+  class WanContinuousFlowMatchScheduler {
+    +sample_training_t()
+    +add_noise()
+    +training_target()
+    +training_weight()
+  }
+
+  Wan22Trainer --> FastWAM : optimizes
+  FastWAM *-- MoT
+  FastWAM --> WanVideoDiT : video_expert
+  FastWAM --> ActionDiT : action_expert
+  MoT o-- WanVideoDiT
+  MoT o-- ActionDiT
+  FastWAM --> WanContinuousFlowMatchScheduler : video and action
+  RobotVideoDataset --> FastWAMProcessor
+  Wan22Trainer --> RobotVideoDataset : batches
+```
+
+---
+
+### 12.6 数据集、`build_datasets` 与 DataLoader
+
+```333:344:src/fastwam/runtime.py
+def build_datasets(data_cfg: DictConfig):
+    train_ds = instantiate(data_cfg.train)
+    ...
+    val_ds = instantiate(data_cfg.val, pretrained_norm_stats=...)  # 或 val_ds = train_ds
+```
+
+**训练集首次运行**：主进程 `get_dataset_stats` → `dataset_stats.json` → `processor.set_normalizer_from_stats`（第 10 章）。
+
+**DataLoader**（[`trainer._build_loader`](../../src/fastwam/trainer.py) L167–182）：
+
+- `ResumableEpochSampler`：每个 epoch 对 \(|D|\) 做 `randperm`（种子 `seed + epoch`）；
+- `shuffle=False`（顺序由 sampler 决定）；
+- **无** `collate_fn` → PyTorch 默认将同名 tensor **stack** 出 batch 维。
+
+#### 一次 `__getitem__` 的调用序列
+
+```mermaid
+sequenceDiagram
+  participant DL as DataLoader Worker
+  participant RVD as RobotVideoDataset
+  participant BLD as BaseLerobotDataset
+  participant FWP as FastWAMProcessor
+  participant MLD as MultiLeRobotDataset
+
+  DL->>RVD: __getitem__(idx)
+  RVD->>BLD: lerobot_dataset[idx]
+  BLD->>MLD: delta_timestamps 对齐 33 帧
+  MLD-->>BLD: raw tensors + task string
+  BLD->>FWP: preprocess
+  FWP-->>BLD: pixel_values action proprio pads
+  BLD-->>RVD: dict
+  RVD->>RVD: 抽稀 9 帧 拼相机 归一化
+  RVD->>RVD: load T5 cache from prompt hash
+  RVD-->>DL: video action proprio context ...
+  Note over DL: collate → B x ...
+```
+
+**进入 Trainer 的 batch 字段**（与 `training_loss` 对齐）：
+
+| 键 | 形状（LIBERO 例） |
+|----|-------------------|
+| `video` | `[B, 3, 9, 224, 448]` |
+| `action` | `[B, 32, 7]` |
+| `proprio` | `[B, 32, 8]` |
+| `context` | `[B, 128, D_text]` |
+| `context_mask` | `[B, 128]` |
+| `action_is_pad` / `image_is_pad` | 用于 mask loss |
+
+多卡一致性：初始化后 `_assert_dataset_length_consistent` 要求各 rank 的 `len(dataset)` 相同，否则直接报错。
+
+---
+
+### 12.7 核心前向：`training_loss` 数据流
+
+`FastWAM.forward` 直接转发到 `training_loss`（L1121–1122），Trainer 调用的是：
+
+```python
+loss, loss_dict = train_model.training_loss(sample)
+```
+
+#### 12.7.1 阶段分解
+
+```mermaid
+flowchart TB
+  subgraph in [build_inputs]
+    V[video Bx3xTxHxW] --> VAEe[VAE encode]
+    VAEe --> Lat[input_latents]
+    Lat --> Fix[可选: 固定首帧 latent]
+    P[proprio] --> Ctx[append to context]
+  end
+
+  subgraph noise [加噪]
+    Lat --> Nv[noise_video + t_v]
+    Act[action] --> Na[noise_action + t_a]
+  end
+
+  subgraph mot [MoT]
+    Nv --> PreV[video pre_dit]
+    Na --> PreA[action pre_dit]
+    PreV --> Mask[build_mot_attention_mask]
+    PreA --> Mask
+    Mask --> FWD[mot.forward]
+    FWD --> PostV[video post_dit]
+    FWD --> PostA[action post_dit]
+  end
+
+  subgraph loss [损失]
+    PostV --> Lv["L_vid weighted MSE"]
+    PostA --> La["L_act weighted MSE"]
+    Lv --> Sum["loss_total"]
+    La --> Sum
+  end
+```
+
+**① `build_inputs`**（L277–383）
+
+- `input_latents = _encode_video_latents(video)`：整段 9 帧进 VAE；
+- `fuse_vae_embedding_in_latents` 时保存 `first_frame_latents`，训练后续帧加噪但首帧保持干净；
+- `proprio[:, 0, :]` 经 `proprio_encoder` 拼入 `context`（当前步本体）；
+- 校验 \(T \bmod 4 = 1\)，\(H,W\) 被 16 整除，动作步数整除 \(T-1\)。
+
+**② 加噪与目标**（论文 Flow Matching）
+
+\[
+y_t = (1-t)y + t\epsilon, \quad \hat{v} = f_\theta(y_t,t,\cdot), \quad \mathcal{L} = \|\hat{v} - (\epsilon - y)\|^2
+\]
+
+```49:61:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def add_noise(self, original_samples, noise, timestep):
+        sigma = (timestep / float(self.num_train_timesteps)).to(...)
+        return (1 - sigma) * original_samples + sigma * noise
+
+    @staticmethod
+    def training_target(sample, noise, timestep):
+        return noise - sample
+```
+
+video 与 action **各自独立采样** \(t\)（`sample_training_t`），再联合过 MoT——体现「联合建模、独立噪声水平」。
+
+**③ MoT + mask**
+
+- `_build_mot_attention_mask`：action 只看首帧 video（第 3、11 章）；
+- `mot.forward(embeds_all, attention_mask, ...)`：30 层混合注意力 + cross-attn(T5)。
+
+**④ 损失聚合**
+
+```563:567:src/fastwam/models/wan22/fastwam.py
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+```
+
+`image_is_pad` / `action_is_pad` 在 token 维做 masked mean，避免 padding 帧污染。
+
+Joint / IDM 变体：**替换** `training_loss` 与 mask 构建（`FastWAMJoint` / `FastWAMIDM`），Trainer 循环不变，仍调用 `model.training_loss(sample)`。
+
+---
+
+### 12.8 `Wan22Trainer` 主循环与分布式语义
+
+#### 12.8.1 初始化顺序（摘要）
+
+| 顺序 | 操作 |
+|------|------|
+| 1 | `_apply_dit_only_train_mode`（构造 Optimizer 前） |
+| 2 | AdamW + LR Scheduler（5% warmup + cosine） |
+| 3 | `DataLoader` + `ResumableEpochSampler` |
+| 4 | 估算并设置 `max_steps` |
+| 5 | `accelerator.prepare(model, optimizer, loader, scheduler)` |
+| 6 | wandb、`resume` 加载 |
+
+#### 12.8.2 训练循环序列图
+
+```mermaid
+sequenceDiagram
+  participant Trainer as Wan22Trainer.train
+  participant Loader as train_loader
+  participant Acc as Accelerator
+  participant M as FastWAM
+  participant Opt as AdamW
+  participant Sch as LRScheduler
+
+  Trainer->>Trainer: set_dit_only_train_mode
+  loop Until max_steps
+    Trainer->>Loader: next batch
+    alt Epoch rollover
+      Trainer->>Trainer: epoch++ and reset iterator
+    end
+    Trainer->>Acc: accumulate
+    Trainer->>M: training_loss
+    M-->>Trainer: loss and loss_dict
+    Trainer->>Acc: backward
+    alt On sync_gradients
+      Acc->>Acc: clip_grad_norm
+      Acc->>Opt: optimizer step
+      Acc->>Sch: scheduler step
+      Acc->>Opt: zero_grad
+      Trainer->>Trainer: global_step increment
+      Trainer->>Acc: gather metrics
+      alt Eval interval
+        Trainer->>M: evaluate and infer_joint
+      end
+      alt Save interval
+        Trainer->>Trainer: save_checkpoint
+      end
+    end
+  end
+```
+
+**梯度累积**：`gradient_accumulation_steps > 1` 时，仅当 `accelerator.sync_gradients` 为真才 `optimizer.step()`（L677–683），有效 batch 变大而显存占用接近 micro-batch。
+
+**日志**：`accelerator.gather` 对所有 rank 的 loss 取平均；`log_every` 打印 `loss_video` / `loss_action` 分解（来自 `loss_dict`）。
+
+#### 12.8.3 训练期 `evaluate()` 做什么
+
+与部署不同，验证阶段（L377+）：
+
+1. 随机取 val 样本，`training_loss` → `val_loss`；
+2. **`model.infer(...)`** → 内部 **`infer_joint`**，生成整段视频 + 动作；
+3. 算 PSNR/SSIM（预测视频 vs GT）、VAE 重建基线、可选 action L1/L2（反归一化后）。
+
+因此 wandb 上的 `eval/psnr_*` 反映的是 **想象路径**，不是 `infer_action` 部署路径（第 11 章）。调参时不要与仿真 success rate 混为一谈。
+
+---
+
+### 12.9 Checkpoint 保存与恢复
+
+#### 12.9.1 `save_checkpoint()`
+
+每 `save_every` 步及训练结束（L762–790）：
+
+1. **权重文件**（主进程）：`checkpoints/weights/step_{global_step:06d}.pt`
+
+```1088:1098:src/fastwam/models/wan22/fastwam.py
+    def save_checkpoint(self, path, optimizer=None, step=None):
+        payload = {
+            "mot": self.mot.state_dict(),
+            "step": step,
+            "torch_dtype": str(self.torch_dtype),
+        }
+        if self.proprio_encoder is not None:
+            payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+```
+
+**不包含** VAE、Wan 全量副本；推理/续训需仍能访问 **原始 Wan2.2 权重** + 此 finetune 文件。
+
+2. **训练状态目录**：`checkpoints/state/step_XXXXXX/`
+   - `accelerator.save_state`：optimizer、scheduler、DeepSpeed 分片等；
+   - `trainer_state.json`：`global_step`、`epoch`、`batch_in_epoch`（供 DataLoader 续跑）。
+
+#### 12.9.2 `resume`
+
+| `cfg.resume` 形式 | 行为 |
+|-------------------|------|
+| 目录 `.../checkpoints/state/step_XXXXXX` | `load_training_state`：恢复优化器 + sampler 偏移 |
+| 单个 `.pt` | 仅 `load_checkpoint` 权重；**不**恢复 optimizer/step（L277 警告） |
+
+仿真评测加载 release ckpt 时走 `load_checkpoint` + 外部 `dataset_stats.json`（`sim_*.yaml` 中 `skip_dit_load_from_pretrain: true` 等），属于另一条推理管线。
+
+---
+
+### 12.10 与论文训练设定（Sec.4.1）的对照
+
+| 论文 | 本仓库落点 |
+|------|------------|
+| Wan2.2-5B + 1B action expert | `load_wan22` + `ActionDiT.from_pretrained` |
+| 32 动作 / 9 视频帧 | `num_frames=33`, `action_video_freq_ratio=4` |
+| Flow matching, shift=5 | 双 `WanContinuousFlowMatchScheduler` |
+| \(\mathcal{L}_{act} + \lambda \mathcal{L}_{vid}\) | `training_loss` |
+| AdamW \(10^{-4}\), wd 0.01, cosine | task yaml + `lr_scheduler_type: cosine` |
+| bf16, grad clip 1.0 | `train.yaml` + `max_grad_norm` |
+| LIBERO 20k / RoboTwin 30k steps | CLI `max_steps=`（推荐） |
+| 推理 10 steps, CFG=1.0 | `eval_num_inference_steps` + sim yaml |
+
+---
+
+### 12.11 阅读与调试建议
+
+**推荐阅读顺序（设断点）**：
+
+1. `scripts/train.py` → `runtime.run_training`
+2. `Wan22Trainer.train` L659–675（单步）
+3. `FastWAM.training_loss` → `build_inputs` → `mot.forward`
+4. 对比 `FastWAMJoint.training_loss` / `FastWAMIDM.training_loss` 理解对照实验
+
+**常见问题**：
+
+| 现象 | 可能原因 |
+|------|----------|
+| `Missing text embedding cache` | 未跑 `precompute_text_embeds.py` |
+| `Video T must satisfy T % 4 == 1` | 数据抽稀帧数与 Wan 约定不符 |
+| `dataset length mismatch across ranks` | 多卡下数据集长度不一致 |
+| 训练 loss 降、仿真差 | 检查 eval 是否用 release ckpt + stats；指令 unseen/seen |
+| 显存 OOM | 减小 `batch_size`；`mot_checkpoint_mixed_attn: true`（model yaml 默认 true，task 常关） |
+
+**与推理 pipeline 的分界**：训练只调用 `training_loss`；`infer_action` 在 `experiments/*` 与 `deploy_policy.py` 中，不在 `Wan22Trainer.train` 热路径上。
+
+---
+
+### 12.12 小结
+
+Fast-WAM 训练 pipeline 可概括为：
+
+**Hydra 配置 → Accelerate 多进程 → `RobotVideoDataset` 产出 batch → `FastWAM.training_loss` 在 MoT 上联合优化视频与动作 Flow Matching 目标 → ZeRO-1 更新 MoT（及 proprio_encoder）→ 周期性 `evaluate`（joint 想象）与 `save_checkpoint`（仅 MoT 权重 + 全状态）。**
+
+理解这一条链后，可自行改 `task`/`model`、插拔 Joint/IDM、设 `lambda_video=0` 做消融，或对齐论文 `max_steps` 复现表格——而不必在 Wan 全量 5B 参数上端到端微调。
 
 ---
 
