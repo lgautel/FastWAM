@@ -19,6 +19,7 @@
 10. [训练数据格式与处理流水线](#10-训练数据格式与处理流水线)
 11. [论文内容与本地实现对照](#11-论文内容与本地实现对照)
 12. [训练 Pipeline 全链路解析](#12-训练-pipeline-全链路解析)
+13. [多相机拼接：数据溯源、处理与实现](#13-多相机拼接数据溯源处理与实现)
 
 ---
 
@@ -549,8 +550,58 @@ Fast-WAM 用 **结构化 mask + 首帧 KV cache** 把这一结论写进架构，
 1. **算力**：6B 模型 + 8×GPU 训练是论文默认；RoboTwin 论文用 64 卡加速，仓库 README 建议可减卡/减 epoch。
 2. **依赖 Wan 权重**：需 `DIFFSYNTH_MODEL_BASE_PATH` 与 Hugging Face 上的 Wan2.2 组件。
 3. **真机数据未开源**：毛巾折叠只能参考论文设置，无法完全复现真机数字。
-4. **外层自回归**：论文聚焦**单个 action chunk**；长程任务靠环境闭环 + replan（`replan_steps` in sim config），未在本文展开。
+4. **外层自回归**：论文聚焦**单个 action chunk**；长程任务靠环境闭环 + replan（`replan_steps`，见下节）；**不是** test-time 上自回归生成更长视频。
 5. **评测细节**：unseen vs seen 指令、RoboTwin 跳帧渲染等会改变分数与视频观感，对比基线时需对齐协议。
+
+#### `replan_steps` 含义与调参
+
+`replan_steps` 是 **仿真评测 / 部署时的闭环控制参数**（写在 [`configs/sim_libero.yaml`](../../configs/sim_libero.yaml)、[`configs/sim_robotwin.yaml`](../../configs/sim_robotwin.yaml) 的 `EVALUATION` 下，或 RoboTwin 的 [`deploy_policy.yml`](../../experiments/robotwin/fastwam_policy/deploy_policy.yml)），**不参与训练**。
+
+**含义**：模型每次 `infer_action` 预测一整段 action chunk（默认 `action_horizon = 32`）。`replan_steps` 表示 **在重新观测并再次调用策略之前，环境里实际执行该 chunk 的前多少步**；chunk 中剩余步被丢弃，用新图像重规划（receding horizon）。
+
+```mermaid
+flowchart LR
+  obs0["当前观测"] --> infer["infer_action\n输出 32 步"]
+  infer --> exec["执行前 replan_steps 步"]
+  exec --> obs1["新观测"]
+  obs1 --> infer
+```
+
+实现上会被限制在 \([1,\ \texttt{action\_horizon}]\)（[`deploy_policy.py`](../../experiments/robotwin/fastwam_policy/deploy_policy.py) L171）。LIBERO 评测在 `pending_actions` 为空时取 `action_chunk[:replan_steps]`（[`eval_libero_single.py`](../../experiments/libero/eval_libero_single.py) L490–516）。
+
+**在管线中的作用**
+
+| 环节 | 作用 |
+|------|------|
+| 长程任务 | 把「单 chunk 模型」接到整段 episode：周期性闭环，对应论文 Sec.3.3「只研究 single chunk，长程靠环境 replan」 |
+| 开环/闭环 | 一次推理 32 步「计划」，只执行前 `replan_steps` 步；越小越闭环，越大越开环 |
+| 算力/延迟 | 约每 `replan_steps` 个环境步调用 **1 次** `infer_action`；越小推理次数越多、评测越慢 |
+| 与训练 | 训练仍按 32 步 chunk + 9 帧视频联合学习；改 `replan_steps` **不改权重**，只改评测/部署控制律 |
+
+**仓库默认（复现表格宜对齐）**
+
+| 场景 | 典型 `replan_steps` | 配置 |
+|------|---------------------|------|
+| LIBERO 评测 | 10 | `configs/sim_libero.yaml` |
+| RoboTwin 评测 | 24 | `configs/sim_robotwin.yaml` |
+| RoboTwin `deploy_policy` | 8 | `experiments/robotwin/fastwam_policy/deploy_policy.yml` |
+
+**调大 / 调小对效果的影响**
+
+| 方向 | 行为 | 对成功率 / 控制 | 对速度 / 资源 |
+|------|------|-----------------|----------------|
+| **调小**（如 24→10→1） | 更频繁用新观测重规划 | 对模型误差、接触变化、扰动更敏感，往往更稳；`replan_steps=1` 为逐步闭环 | 单 episode 推理次数 ↑，评测/真机 **更慢** |
+| **调大**（如 10→24→32） | 更长时间开环执行同一 chunk 前段 | chunk 与真实状态偏离时 **误差累积**；接近 32 时几乎一次推理用满 horizon | 推理次数 ↓，**更快** |
+| **> action_horizon** | 被 clamp 到 32 | 与 `replan_steps=32` 等价 | — |
+
+工程直觉（无官方 ablation）：与 Motus / 其它 chunk 策略基线比数时，**必须对齐各 benchmark 的 `replan_steps` 协议**；随意改动后再和论文 Table 对比会失真。真机侧则在「平均控制频率 / 190ms 推理预算」与「开环段长度」之间权衡。
+
+**与 `action_video_freq_ratio` 的区别**
+
+- **`action_video_freq_ratio`**（§10.2）：**训练数据**里动作步与视频帧的时间比例（33 观测 → 9 帧视频 + 32 步动作）。
+- **`replan_steps`**：**评测/部署**里多久重新 `infer_action` 一次；二者独立，勿混用。
+
+**可选相关项**：`EVALUATION.visualize_future_video=true` 时用 `replan_steps // action_video_freq_ratio` 决定保留多少「未来视频帧」用于调试可视化，**不是**默认部署路径。RoboTwin 另有 `skip_get_obs_within_replan`：队列未排空时可跳过重复取 obs，不改变「每 `replan_steps` 才重新推理」的语义。
 
 ### 8.4 可延伸方向
 
@@ -612,7 +663,7 @@ Fast-WAM 用 **结构化 mask + 首帧 KV cache** 把这一结论写进架构，
 对每个 `shape_meta` 里的 key，按数据集 fps 构造相对时间戳列表。以图像为例，观测时间戳为：
 
 \[
-\tau_t = \frac{t \cdot \text{global\_sample\_stride}}{\text{fps}}, \quad t = 0, 1, \ldots, \text{obs\_size} - 1
+$$\tau_t = \frac{t \cdot \text{global\_sample\_stride}}{\text{fps}}, \quad t = 0, 1, \ldots, \text{obs\_size} - 1$$
 \]
 
 动作时间戳同理，长度为 `action_size`。LeRobot 据此从 episode 中**对齐抽取**多模态序列；若 episode 边界不足，会产生 `*_is_pad` 标记。
@@ -650,11 +701,81 @@ Fast-WAM 用 **结构化 mask + 首帧 KV cache** 把这一结论写进架构，
 | `val_set_proportion` | 0（全量训练） | 0.01 |
 | `text_embedding_cache_dir` | `./data/text_embeds_cache/libero` | `./data/text_embeds_cache/robotwin` |
 
+#### `action_video_freq_ratio` 含义与调参
+
+记 r = `action_video_freq_ratio`。在 [`robot_video_dataset.py`](../../src/fastwam/datasets/lerobot/robot_video_dataset.py) 中：
+
+- **底层仍从 LeRobot 拉满 `num_frames` 个观测**（默认 33），对应 **`num_frames - 1 = 32` 步动作**（[`base_lerobot_dataset.py`](../../src/fastwam/datasets/lerobot/base_lerobot_dataset.py) 的 `obs_size` / `action_size`）。
+- **仅对像素序列做时间下采样**：`video_sample_indices = [0, r, 2r, …, num_frames-1]`。
+- **`action` 不做下采样**，仍为 32 步。
+
+数量关系：
+
+\[
+$$T_a = \text{num\_frames} - 1 = 32,\qquad
+T_v = \frac{\text{num\_frames}-1}{r} + 1$$
+\]
+
+\($r=4,\ \text{num\_frames}=33$\) → \($T_v=9$\)，索引 `0,4,8,…,32`。可理解为：**在同一训练窗口内，动作时间分辨率是保留视频帧的 r 倍**（每 1 帧图像对应 r 个连续控制步动作）。
+
+```mermaid
+flowchart LR
+  subgraph raw [LeRobot 窗口 T=33]
+    o0["obs t0"] --> o1["t1"] --> o2["..."] --> o32["t32"]
+  end
+  subgraph video [视频分支 抽稀 r=4]
+    v0["帧0"] --> v1["帧4"] --> v2["..."] --> v8["帧32"]
+  end
+  subgraph action [动作分支 不抽稀]
+    a["32 步 action\n对应 t0→t31"]
+  end
+  raw --> video
+  raw --> action
+```
+
+**在管线中的作用**
+
+| 环节 | 作用 |
+|------|------|
+| 数据 | 降低送入 VAE / video DiT 的帧数，节省显存与算力；动作仍保持细粒度 32 步 |
+| 对齐 | `build_inputs` 要求 `action.shape[1] % (T_v - 1) == 0`（[`fastwam.py`](../../src/fastwam/models/wan22/fastwam.py) L308–310），即相邻视频帧之间恰好 \(r\) 个动作步 |
+| Wan 约束 | 抽稀后 $T_v \equiv 1 \pmod{4}$；数据集初始化另要求 \($(\text{num\_frames}-1)/r \equiv 0 \pmod{4}$\) |
+| 论文/复现 | 与 Fast-WAM 设定一致：**32 步动作 + 9 帧视频** |
+| 推理/可视化 | 仅当 `visualize_future_video=true` 时，用 `replan_steps // action_video_freq_ratio` 决定保留多少未来视频帧（[`eval_libero_single.py`](../../experiments/libero/eval_libero_single.py)；`replan_steps` 见 §8.3） |
+
+**注意**：`RobotVideoDataset` 里 `proprio = sample["proprio"][:-1, :]` 与 32 步 action 对齐；**被下采样的是 `pixel_values`（视频）**，不是 action 张量。
+
+**调大 / 调小（不能单独改 \(r\)）**
+
+改 \(r\) 时需同时满足：
+
+1. \($(\text{num\_frames}-1) \bmod r = 0$\)
+2. \($(\text{num\_frames}-1)/r \bmod 4 = 0$\)
+3. \($T_v = (\text{num\_frames}-1)/r + 1 \equiv 1 \pmod{4}$\)
+
+在 **`num_frames=33` 固定**时，合法 \(r\) 主要为 **1、2、4、8**（\(r=1\) 得 33 帧视频，算力极大，一般不用）。
+
+| 方向 | 固定 32 步动作时的效果 | 算法/工程后果 |
+|------|------------------------|---------------|
+| **调大 \(r\)**（如 4→8） | \(T_v\) 9→5，视频更稀疏 | 视频 token/算力下降；每段视频间隔内要建模的动作从 4 步→8 步，视觉条件更粗；可能损失快速运动细节；需 **重新训练**，旧 checkpoint 时序结构不匹配 |
+| **调小 \(r\)**（如 4→2） | \(T_v\) 9→17，视频更密 | 运动线索更细，视频 loss / VAE 更重；每段仅 2 步 action；需重训并满足 Wan 帧数约束 |
+| **只改 \(r\)** | — | 可能触发 `RobotVideoDataset` **assert**，训练无法启动 |
+| **改 \(r\) 且改 `num_frames`** | 可改变总 horizon | 新实验设定，与论文 32/9 不可直接对比 |
+
+工程直觉（仓库内无官方 ablation）：\(r\) 过大则世界模型看到的帧太少，视频–动作时序耦合变弱；\(r\) 过小则接近密集 joint video–action，算力接近 imagine-then-execute，偏离「稀疏视频 + 密集动作」设计。**默认 \(r=4\) 与 HF 配置、论文一致；推理配置应与训练一致。**
+
+**与 VAE 时间 4× 下采样的区别**
+
+- **`action_video_freq_ratio`**：在**数据集像素序列**上抽帧（33→9）。
+- **`vae.temporal_downsample_factor`**：在**已抽稀后的 9 帧**上再进 Wan VAE 做 latent 时间压缩。
+
+两层叠加，勿混为一个参数。
+
 #### 帧数硬约束（与 Wan VAE 对齐）
 
 `RobotVideoDataset` 初始化时断言：
 
-```59:63:src/fastwam/datasets/lerobot/robot_video_dataset.py
+```python src/fastwam/datasets/lerobot/robot_video_dataset.py:59:63
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
@@ -662,13 +783,13 @@ Fast-WAM 用 **结构化 mask + 首帧 KV cache** 把这一结论写进架构，
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 ```
 
-记 \(r = \texttt{action\_video\_freq\_ratio}\)，则需：
+记 \($r = \texttt{action\_video\_freq\_ratio}$\)，则需：
 
 \[
-\text{num\_frames} - 1 \equiv 0 \pmod{r}, \qquad \frac{\text{num\_frames}-1}{r} \equiv 0 \pmod{4}
+$$\text{num\_frames} - 1 \equiv 0 \pmod{r}, \qquad \frac{\text{num\_frames}-1}{r} \equiv 0 \pmod{4}$$
 \]
 
-后者保证抽稀后的视频帧数 \(T_v = \frac{\text{num\_frames}-1}{r} + 1\) 在 **`build_inputs` 中满足 Wan 约定 \(T_v \equiv 1 \pmod{4}\)**（`fastwam.py` L296–297）。
+后者保证抽稀后的视频帧数 \($T_v = \frac{\text{num\_frames}-1}{r} + 1$\) 在 **`build_inputs` 中满足 Wan 约定 \($T_v \equiv 1 \pmod{4}$\)**（`fastwam.py` L296–297）。
 
 ### 10.3 双层 Dataset 架构
 
@@ -734,7 +855,7 @@ sequenceDiagram
 
 #### （1）指令处理 `augment_instruction`
 
-```120:147:src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+```python 120:147:src/fastwam/datasets/lerobot/processors/fastwam_processor.py
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:
         ...
         if np.random.rand() < self.drop_high_level_prob:
@@ -765,7 +886,7 @@ train_transforms:
 
 若配置了 `delta_action_dim_mask`（LIBERO 前 6 维为 delta 位姿，第 7 维夹爪为绝对量），在**归一化之前**把 padding 时间步上的 delta 维置零，避免无效差分污染统计：
 
-```251:259:src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+```python 251:259:src/fastwam/datasets/lerobot/processors/fastwam_processor.py
         if "action" in data and self.delta_action_dim_mask is not None:
             action_is_pad = torch.as_tensor(data["action_is_pad"], dtype=torch.bool)
             if bool(action_is_pad.any().item()):
@@ -793,13 +914,15 @@ LIBERO / RoboTwin 的 yaml 中均为 **`null`**。仓库虽实现 `RelativePoseT
 
 #### 视频抽稀与多相机
 
-```63:63:src/fastwam/datasets/lerobot/robot_video_dataset.py
+**多相机空间拼接、LIBERO/RoboTwin 布局差异、评测/部署对齐与优化**见 **第 13 章**。下文仅保留与抽稀相关的最小代码摘录。
+
+```python 63:63:src/fastwam/datasets/lerobot/robot_video_dataset.py
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 ```
 
 从 Processor 输出的 `pixel_values`（33 帧）上取索引 `[0,4,8,...,32]`，得到 **9 帧**。两相机水平拼接示例：
 
-```179:181:src/fastwam/datasets/lerobot/robot_video_dataset.py
+```python 179:181:src/fastwam/datasets/lerobot/robot_video_dataset.py
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)
 ```
@@ -817,7 +940,7 @@ RoboTwin 的 `robotwin` 模式先将各相机 resize 到固定子分辨率，再
 
 #### proprio 与 action 时间对齐
 
-```202:203:src/fastwam/datasets/lerobot/robot_video_dataset.py
+```python 202:203:src/fastwam/datasets/lerobot/robot_video_dataset.py
         action = sample["action"] # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
 ```
@@ -826,11 +949,11 @@ RoboTwin 的 `robotwin` 模式先将各相机 resize 到固定子分辨率，再
 
 #### 语言条件：Prompt 模板 + 离线 T5
 
-```16:16:src/fastwam/datasets/lerobot/robot_video_dataset.py
+```python 16:16:src/fastwam/datasets/lerobot/robot_video_dataset.py
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 ```
 
-```216:221:src/fastwam/datasets/lerobot/robot_video_dataset.py
+```python 216:221:src/fastwam/datasets/lerobot/robot_video_dataset.py
         instruction = DEFAULT_PROMPT.format(task=task)
         context, context_mask = self._get_cached_text_context(instruction)
         context[~context_mask] = 0.0
@@ -1233,7 +1356,7 @@ flowchart TB
 | unseen 指令（对齐 Motus） | `EVALUATION.instruction_type: unseen`（RoboTwin）；LIBERO 用任务文本 |
 | 发布 checkpoint | Hugging Face `yuanty/fastwam` |
 
-**评测闭环（非论文外层视频 AR）**：环境每 `replan_steps` 步重新调用策略；`action_horizon=32` 的 chunk 只执行前 `replan_steps` 步（`deploy_policy.py`）。这与论文「单 chunk、省略外层 AR」的 controlled comparison **一致**。
+**评测闭环（非论文外层视频 AR）**：环境每 `replan_steps` 步重新调用策略；`action_horizon=32` 的 chunk 只执行前 `replan_steps` 步（`deploy_policy.py`）。详见 **§8.3 `replan_steps` 含义与调参**。这与论文「单 chunk、省略外层 AR」的 controlled comparison **一致**。
 
 **可选：可视化未来视频**：`EVALUATION.visualize_future_video=true` 时走 `infer_joint`（`eval_libero_single.py` L414–415），用于调试/可视化，**不是** 默认部署路径。
 
@@ -1290,7 +1413,7 @@ bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
 #### （4）外层长程「生成更长未来视频」的自回归
 
 - **缺失**：无论文外的长视频 AR rollout。
-- **设计**：论文 Sec.3.3 明确只研究 **single action chunk**；长任务靠环境 **replan**（执行 `replan_steps` 后重新观测）。
+- **设计**：论文 Sec.3.3 明确只研究 **single action chunk**；长任务靠环境 **replan**（执行 `replan_steps` 后重新观测）。参数说明见 **§8.3**。
 - **影响**：与论文 controlled setting **一致**；不是实现疏漏。
 
 #### （5）Embodied 预训练与第三方 WAM 训练
@@ -1930,6 +2053,290 @@ Fast-WAM 训练 pipeline 可概括为：
 **Hydra 配置 → Accelerate 多进程 → `RobotVideoDataset` 产出 batch → `FastWAM.training_loss` 在 MoT 上联合优化视频与动作 Flow Matching 目标 → ZeRO-1 更新 MoT（及 proprio_encoder）→ 周期性 `evaluate`（joint 想象）与 `save_checkpoint`（仅 MoT 权重 + 全状态）。**
 
 理解这一条链后，可自行改 `task`/`model`、插拔 Joint/IDM、设 `lambda_video=0` 做消融，或对齐论文 `max_steps` 复现表格——而不必在 Wan 全量 5B 参数上端到端微调。
+
+---
+
+## 13. 多相机拼接：数据溯源、处理与实现
+
+本章专述 Fast-WAM 如何把 **多路 RGB 观测** 变成模型可吃的 **单路视频张量** `video: [C, T_v, H, W]`。§10 已覆盖整条数据流水线；此处只深挖 `concat_multi_camera`、`shape_meta.images` 顺序，以及训练 / 评测 / 部署三条路径的一致性。
+
+### 13.1 设计动机：为何拼成单张「伪宽屏」视频
+
+Wan2.2 视频分支与 `FastWAM.build_inputs` 约定输入为 **5D 单路 RGB**：
+
+\[
+\text{video} \in \mathbb{R}^{B \times 3 \times T \times H \times W}
+\]
+
+仓库 **没有**「每相机独立 VAE / 独立 patch 网格」的一等公民 API。因此官方做法是把多相机在 **空间维** 拼成一幅大图画，再当作一条短视频送入 VAE 与 video DiT，与 MoT 的 action 支路联合训练（§3、§12）。
+
+配置开关：`data.train.concat_multi_camera` ∈ `{horizontal, vertical, robotwin}`（`None` 时单相机 `squeeze`）。实现集中在 [`robot_video_dataset.py`](../../src/fastwam/datasets/lerobot/robot_video_dataset.py) L154–190。
+
+**硬约束**：拼接后的 \(H, W\) 须被 16 整除，否则 `build_inputs` 报错（[`fastwam.py`](../../src/fastwam/models/wan22/fastwam.py) L292–295）。LIBERO \(224 \times 448\)、RoboTwin \(384 \times 320\) 均满足。
+
+### 13.2 数据从哪里来、如何采集与索引
+
+#### 13.2.1 磁盘与 LeRobot 键映射
+
+| Benchmark | 本地路径（见 [README](../../README.md)） | `shape_meta.images[].key` | 默认 `lerobot_key` | 相机数 |
+|-----------|----------------------------------------|---------------------------|-------------------|--------|
+| LIBERO | `data/libero_mujoco3.3.2/*_noops_lerobot` | `image`, `wrist_image` | `observation.images.image`, `observation.images.wrist_image` | 2 |
+| RoboTwin | `data/robotwin2.0/robotwin2.0`（HF [robotwin2.0-fastwam](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)） | `cam_high`, `cam_left_wrist`, `cam_right_wrist` | `observation.images.<key>` | 3 |
+
+YAML 见 [`configs/data/libero_2cam.yaml`](../../configs/data/libero_2cam.yaml)、[`configs/data/robotwin.yaml`](../../configs/data/robotwin.yaml)。`num_output_cameras` 与 `images` 列表长度一致（LIBERO 2，RoboTwin 3）。
+
+#### 13.2.2 采集形态与时间对齐
+
+- **形态**：仿真 / 遥操作 episode 已离线转为 LeRobot v2 目录（`meta/`、`data/`、`videos/`）。训练时 **不再** 向环境采图，只做帧索引读取。
+- **时间窗口**：`obs_size = num_frames = 33`，`action_size = 32`（§10.1）。对 **每个** 图像 key，[`BaseLerobotDataset`](../../src/fastwam/datasets/lerobot/base_lerobot_dataset.py) 构造 **相同长度** 的 `delta_timestamps`（L68–76），`MultiLeRobotDataset` 在 **统一 fps** 下对齐抽取，保证各相机、state、action 同一物理时刻。
+- **原始像素**：`_get_image` 读 LeRobot 浮点张量，×255 转 `uint8`，形状 `[T, C, H, W]`（L150–157）。`raw_shape` 在 meta 中声明（如 LIBERO 512×512），当前实现 **不** 在 `_get_image` 里强制 assert 与磁盘一致。
+- **Pad 掩码**：`image_is_pad` 取自 **第一个** `image_meta` 的 `lerobot_key`（L234），默认假设各相机时间轴 pad 一致；若某相机缺帧而另一路正常，mask 可能偏乐观（§13.7）。
+
+```mermaid
+sequenceDiagram
+  participant Disk as LeRobot_on_disk
+  participant MLD as MultiLeRobotDataset
+  participant BLD as BaseLerobotDataset
+  participant FWP as FastWAMProcessor
+  participant RVD as RobotVideoDataset
+
+  Disk->>MLD: delta_timestamps 多 key 同轴
+  MLD->>BLD: lerobot_sample T=33
+  BLD->>FWP: images 字典 每相机独立
+  FWP->>RVD: pixel_values num_cam x T x C x H x W
+  RVD->>RVD: 抽稀 T_v 再 concat 再全局几何
+```
+
+### 13.3 两阶段处理架构（核心）
+
+多相机 **不是** 在 LeRobot 层就拼好，而是 **先分相机预处理，再在 `RobotVideoDataset` 里拼接**。
+
+```mermaid
+flowchart TB
+  subgraph stageA [阶段A FastWAMProcessor 分相机]
+    I1["cam0: T x 3 x H0 x W0"]
+    I2["cam1: T x 3 x H0 x W0"]
+    I3["cam2: T x 3 x H0 x W0"]
+    Stack["stack -> num_cam x T x C x H x W"]
+  end
+  subgraph stageB [阶段B RobotVideoDataset]
+    Sub["video_sample_indices T->T_v"]
+    Cat["concat horizontal 或 robotwin"]
+    Geom["ResizeSmallestSide + CenterCrop + Norm"]
+    Out["video 3 x T_v x H_final x W_final"]
+  end
+  I1 --> Stack
+  I2 --> Stack
+  I3 --> Stack
+  Stack --> Sub --> Cat --> Geom --> Out
+```
+
+#### 阶段 A：`FastWAMProcessor.preprocess`
+
+[`fastwam_processor.py`](../../src/fastwam/datasets/lerobot/processors/fastwam_processor.py) L214–243：
+
+1. 按 `shape_meta["images"]` **列表顺序**遍历相机（顺序决定后续 `horizontal` 左右关系）。
+2. 每路：`ToTensor`（uint8→float \([0,1]\)）→ `Resize` 到 meta `shape`（LIBERO **224×224**；RoboTwin **240×320**）。
+3. `torch.stack(processed_images, dim=0)` → **`pixel_values`: `[num_cameras, T, C, H, W]`**，**尚未空间拼接**。
+4. 若 `num_output_cameras` 大于实际相机数，前部填真实相机、后部 **零 pad**（L234–237）；官方配置无此情况。
+
+同一步内完成 action/state 归一化与 `ConcatLeftAlign`，与相机无关；时间维仍为 **T=33**。
+
+#### 阶段 B：`RobotVideoDataset._get`
+
+[`robot_video_dataset.py`](../../src/fastwam/datasets/lerobot/robot_video_dataset.py) L142–197：
+
+| 步骤 | 操作 | 输出形状（示意） |
+|------|------|------------------|
+| 1 | `pixel_values[:, video_sample_indices]` 时间抽稀（§10.2，`r=4` → \(T_v=9\)） | `[num_cam, T_v, C, H, W]` |
+| 2 | `concat_multi_camera` 空间拼接 | `[T_v, C, H', W']` |
+| 3 | `ResizeSmallestSide` + `CenterCrop` → `video_size` | 对齐配置 `[H,W]` |
+| 4 | `Normalize(0.5)` + `permute(1,0,2,3)` | `[C, T_v, H, W]`，\([-1,1]\) |
+
+**注意**：阶段 A 的 per-camera `Resize` 与阶段 B 的 **整图** 几何变换是 **两层独立设计**——拼接后仍可能再裁切，RoboTwin `robotwin` 布局尤其如此。
+
+### 13.4 三种拼接模式与像素布局
+
+#### 13.4.1 `horizontal`（LIBERO 默认）
+
+```179:181:src/fastwam/datasets/lerobot/robot_video_dataset.py
+            if self.concat_multi_camera == "horizontal":
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)
+```
+
+- **顺序**：`i=0,1,...` 对应 yaml 中 `images` 顺序。LIBERO 通常为 **第三人称 `image` | 腕部 `wrist_image`**（左→右）。
+- **尺寸**：每路已 224×224 → 拼接后 **224×448**，与 `video_size: [224, 448]` 一致；阶段 B 的 resize/crop 多为 **恒等或微调**。
+
+\[
+H_{\text{final}} = H_0,\quad W_{\text{final}} = N_{\text{cam}} \cdot W_0,\quad N_{\text{cam}}=2 \Rightarrow 224 \times 448
+\]
+
+#### 13.4.2 `vertical`
+
+沿 **高度** `dim=-2` 拼接。仓库支持，LIBERO/RoboTwin 默认 yaml **未使用**；若启用需重新检查 \(H,W \bmod 16\) 与 `video_size`。
+
+#### 13.4.3 `robotwin`（RoboTwin 默认）
+
+**非均匀网格**：顶视大、双腕小，代码 **硬编码** 子分辨率（与 Processor 的 240×320 不同）：
+
+```159:178:src/fastwam/datasets/lerobot/robot_video_dataset.py
+            cam_top = transforms_F.resize(video[0], size=[256, 320], ...)
+            cam_left = transforms_F.resize(video[1], size=[128, 160], ...)
+            cam_right = transforms_F.resize(video[2], size=[128, 160], ...)
+            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
+            video = torch.cat([cam_top, bottom], dim=-2)       # [T_video, C, 384, 320]
+```
+
+- `video[0]` = `cam_high`（头顶）；`video[1]`、`video[2]` = 左右腕。
+- 拼后 **384×320**，再经 `video_size: [384, 320]` 的全局几何。
+
+ASCII 布局（宽 × 高）：
+
+```text
++----------+----------+  256 x 320  (cam_high)
++----+----+
+| L  | R  |            128 x 160 each -> 128 x 320 bottom row
++----+----+
+Total: 384 x 320
+```
+
+#### 13.4.4 模式对照表
+
+| 模式 | 典型 benchmark | 拼接后空间尺寸（训练） | `video_size` |
+|------|----------------|------------------------|--------------|
+| `horizontal` | LIBERO 2 cam | \(H \times (N \cdot W)\) = 224×448 | `[224, 448]` |
+| `robotwin` | RoboTwin 3 cam | 384×320 固定网格 | `[384, 320]` |
+| `vertical` | 未默认启用 | \( (N \cdot H) \times W\) | 需自行对齐 |
+| 单相机 | — | `squeeze(0)` | 由 yaml 定 |
+
+### 13.5 与其它模态及时间轴的对齐
+
+| 模态 | 是否受拼接影响 | 对齐方式 |
+|------|----------------|----------|
+| `action` | 否 | 仍 `[32, D_a]`；与视频 **时间抽稀无关** |
+| `proprio` | 否 | `proprio[:-1]` 与 32 步 action 对齐（L202–203） |
+| `image_is_pad` | 仅时间维 | 先随 `video_sample_indices` 抽稀到 \(T_v\)，再用于 video loss mask |
+| `context` / T5 | 否 | 指令与相机无关；离线 cache |
+| MoT `build_inputs` | 整图 VAE | 单路 latent；`proprio[:,0,:]` 拼入 text context（§10.6），**无 per-camera proprio** |
+
+动作–视频 **时间比例** 由 `action_video_freq_ratio` 决定（§10.2）：\(T_v=9\) 时 8 段视频过渡、每段 4 步 action；拼接 **不** 改变该比例。
+
+### 13.6 评测与部署：训练—推理一致性
+
+| 路径 | 拼接实现 | 注意 |
+|------|----------|------|
+| **训练** | `RobotVideoDataset._get` | 基准 |
+| **LIBERO eval** | [`eval_libero_single.py`](../../experiments/libero/eval_libero_single.py) L207–234：仿真 `image` / `wrist_image` → 各 `_center_crop_resize` → `np.concatenate`（horizontal/vertical） | **不支持** `robotwin`；`assert` 拼后 `(H,W) == video_size` |
+| **RoboTwin deploy** | [`deploy_policy.py`](../../experiments/robotwin/fastwam_policy/deploy_policy.py) `_build_robotwin_image_tensor` L221–234 | NumPy 拼图，与 `robotwin` 子分辨率一致 |
+| **WebSocket** | [`bt/fastwam_ws_server.py`](../../bt/fastwam_ws_server.py) `_prep_image` L245–280 | `robotwin` 后再 `resize`+`center_crop` 到 `video_size` |
+
+**闭环 replan**（§8.3）：每次 `infer_action` 通常只吃 **当前一帧** 拼接图（+ proprio），与训练时 9 帧视频序列不同——这是 **推理剪枝**，不是拼接逻辑错误。
+
+**改配置检查清单**：
+
+1. `concat_multi_camera` 与 benchmark 相机数匹配（`robotwin` 必须 3 路）。
+2. `video_size` 与拼接后几何一致，且 \(H,W \% 16 = 0\)。
+3. `shape_meta.images` 顺序与期望左右/上下关系一致。
+4. 同步修改 eval / deploy / `fastwam_ws_server` 中的拼图代码。
+
+### 13.7 代码核心逻辑与调用链
+
+#### 13.7.1 类关系
+
+```mermaid
+classDiagram
+  class RobotVideoDataset {
+    +lerobot_dataset BaseLerobotDataset
+    +concat_multi_camera str
+    +video_sample_indices list
+    +__getitem__(idx)
+    -_get(idx)
+  }
+  class BaseLerobotDataset {
+    +multi_dataset MultiLeRobotDataset
+    +processor FastWAMProcessor
+    +__getitem__(idx)
+  }
+  class FastWAMProcessor {
+    +preprocess(sample)
+    +num_output_cameras int
+  }
+  RobotVideoDataset *-- BaseLerobotDataset
+  BaseLerobotDataset o-- FastWAMProcessor
+```
+
+#### 13.7.2 训练单样本调用链
+
+```mermaid
+sequenceDiagram
+  participant DL as DataLoader
+  participant RVD as RobotVideoDataset
+  participant BLD as BaseLerobotDataset
+  participant FWP as FastWAMProcessor
+  participant TR as Wan22Trainer
+  participant FM as FastWAM
+
+  DL->>RVD: __getitem__(idx)
+  RVD->>BLD: lerobot_dataset[idx]
+  BLD->>FWP: preprocess (pixel_values 多相机)
+  FWP-->>BLD: action proprio pads
+  BLD-->>RVD: dict
+  RVD->>RVD: 抽稀 + concat + 几何 + T5 cache
+  RVD-->>DL: video action proprio context
+  DL->>TR: collate batch
+  TR->>FM: training_loss(sample)
+  FM->>FM: build_inputs VAE encode MoT
+```
+
+#### 13.7.3 关键代码锚点
+
+| 逻辑 | 文件 | 行号（约） |
+|------|------|------------|
+| `lerobot_key` / `delta_timestamps` | `base_lerobot_dataset.py` | 68–76 |
+| 读图 uint8 | `base_lerobot_dataset.py` | 150–157 |
+| per-camera stack | `fastwam_processor.py` | 214–243 |
+| 时间抽稀 + concat + 归一化 | `robot_video_dataset.py` | 142–197 |
+| Wan 空间约束 | `fastwam.py` | 291–295 |
+| LIBERO eval 拼图 | `eval_libero_single.py` | 207–234 |
+| RoboTwin 部署拼图 | `deploy_policy.py` | 221–234 |
+
+`RobotVideoDataset.camera_key` 在构造时保存但 **未在 `_get` 中使用**——无法仅靠 yaml 选子相机，需改 `shape_meta.images` 或代码。
+
+### 13.8 可优化方向（算法效果 vs 计算性能）
+
+#### 13.8.1 算法 / 表征
+
+- **独立相机 encoder + fusion**：替代像素硬拼，减轻无几何标定的视角混叠；需改 VAE 输入接口或 early-fusion stem。
+- **Camera / layout embedding**：尤其对 `robotwin` 非均匀网格，在 patch 级注入相机 ID 或 2D 位置编码。
+- **同步增广**：跨相机一致 color jitter、同步 random crop（当前 §10 **无** 默认视觉随机增广）。
+- **Per-camera pad mask**：`image_is_pad` 仅来自第一 image key；多路缺帧时应按相机分别 mask。
+
+#### 13.8.2 计算性能
+
+- **合并 Resize**：Processor per-camera Resize + 拼接后再 `ResizeSmallestSide` 构成 **双次** 缩放；可在标定尺寸后改为「仅拼接后一次 resize」。
+- **`robotwin` 三次 `resize`**：对 `[T_v,C,H,W]` 每帧做 3 路缩放，可向量化或前移到 Processor（固定子分辨率预计算）。
+- **统一拼图工具**：训练 Torch / eval NumPy / WS 服务三处逻辑 **重复**；抽 `concat_multicam_torch` + `concat_multicam_numpy` 减少分布漂移与维护成本。
+- **单相机短路**：`num_cameras==1` 已 `squeeze`；多卡批处理时可按样本条件跳过 cat。
+
+#### 13.8.3 配置 / 复现
+
+- 改 `horizontal` ↔ `vertical` 会改变 \(H,W\) 与 Wan patch 纵横比，需重训或至少重跑 eval assert。
+- 与论文 / HF checkpoint 对齐时，**不要**只改 `video_size` 而不改拼接模式（如把 RoboTwin 当成 horizontal 2×240）。
+
+### 13.9 与现有章节的交叉引用
+
+| 主题 | 章节 |
+|------|------|
+| LeRobot 窗口、delta 时间戳 | §10.1 |
+| `action_video_freq_ratio`、\(T_v=9\) | §10.2 |
+| Processor 归一化、无视觉增广 | §10.4 |
+| batch → `build_inputs` | §10.6 |
+| 训练主循环 | §12 |
+| 推理 replan、单帧 `infer_action` | §8.3、§5 |
+
+### 13.10 小结
+
+Fast-WAM 的多相机策略可概括为：**LeRobot 多 key 同轴采样 → Processor 分相机统一 Resize 并 stack → RobotVideoDataset 时间抽稀后在空间维拼接（horizontal 或 robotwin 网格）→ 整图几何归一化 → 单路 `[3, T_v, H, W]` 进 VAE/MoT**。LIBERO 用等分辨率水平条带（224×448）；RoboTwin 用固定三格布局（384×320）。评测与部署必须在 **同一拼图语义** 下喂模型，否则易出现 assert 失败或静默分布偏移。
 
 ---
 
