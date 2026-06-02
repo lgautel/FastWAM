@@ -22,8 +22,8 @@ class FastWAM(torch.nn.Module):
         self,
         video_expert,
         action_expert: ActionDiT,
-        mot: MoT,
         vae,
+        mot: MoT | None = None,
         text_encoder=None,
         tokenizer=None,
         text_dim: Optional[int] = None,
@@ -38,11 +38,18 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        mot_checkpoint_mixed_attn: bool = True,
     ):
         super().__init__()
         self.video_expert = video_expert
         self.action_expert = action_expert
-        self.mot = mot
+        if mot is None:
+            self.mot = MoT(
+                mixtures={"video": self.video_expert, "action": self.action_expert},
+                mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            )
+        else:
+            self.mot = mot
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
 
@@ -144,16 +151,11 @@ class FastWAM(torch.nn.Module):
         if int(len(action_expert.blocks)) != int(len(video_expert.blocks)):
             raise ValueError("ActionDiT `num_layers` must match video expert.")
 
-        mot = MoT(
-            mixtures={"video": video_expert, "action": action_expert},
-            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
-        )
-
         model = cls(
             video_expert=video_expert,
             action_expert=action_expert,
-            mot=mot,
             vae=components.vae,
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
             text_dim=int(video_dit_config["text_dim"]),
