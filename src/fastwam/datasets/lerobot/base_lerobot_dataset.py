@@ -1,7 +1,9 @@
+import os
 import torch
 import numpy as np
 from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
+from torchvision.io import read_video
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
@@ -21,18 +23,27 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # shapes
         shape_meta: Dict[str, Any],
-        action_size: int = 1, 
+        action_size: int = 1,
         past_action_size: int = 0, # Excludes the current frame
-        obs_size: int = 1, # should be 
+        obs_size: int = 1, # should be
         past_obs_size: int = 0,
 
         # train vs val
-        val_set_proportion: float = 0.05, 
+        val_set_proportion: float = 0.05,
         is_training_set: bool = False,
         seed: int = 42,
 
         # sampling
         global_sample_stride: int = 1,
+
+        # video decode tolerance (seconds); with real-PTS parquet timestamps + pyav
+        # backend the nearest frame matches exactly, so a tight tolerance is safe and
+        # also catches genuinely out-of-sync data.
+        tolerance_s: float = 0.005,
+        # video decode backend; "pyav" seeks by timestamp and is robust to VFR videos,
+        # whereas the torchcodec default picks frames by round(ts * average_fps) and
+        # repeatedly falls back (warning spam + double decode) on non-CFR videos.
+        video_backend: str = "pyav",
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -112,6 +123,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
+            tolerances_s=dict.fromkeys(self.dataset_dirs, tolerance_s),
+            video_backend=video_backend,
         )
         
         # HACK: lerobot 3.0 will fix this
@@ -156,6 +169,22 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # For config simplication
         # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
         return image
+
+    def load_full_episode_camera_frames(
+        self,
+        episode_index: int,
+        lerobot_key: str,
+        dataset_index: int = 0,
+    ) -> torch.Tensor:
+        """Load all frames of one camera for a full episode as uint8 ``[T, C, H, W]``."""
+        dataset = self.multi_dataset._datasets[dataset_index]
+        video_path = dataset.root / dataset.meta.get_video_file_path(
+            int(episode_index), lerobot_key
+        )
+        video, _, _ = read_video(str(video_path), pts_unit="sec")
+        if video.numel() == 0:
+            raise RuntimeError(f"No frames decoded from {video_path}")
+        return video.permute(0, 3, 1, 2).contiguous()
     
     def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
         return lerobot_sample
@@ -253,6 +282,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             self.processor.train()
         else:
             self.processor.eval()
+        if os.environ.get("FASTWAM_DUMP_TRANSFORM_MP4") == "1":
+            from .processors.fastwam_processor import register_episode_frame_loader
+
+            register_episode_frame_loader(self.load_full_episode_camera_frames)
+        else:
+            from .processors.fastwam_processor import register_episode_frame_loader
+
+            register_episode_frame_loader(None)
         return self
 
     def get_dataset_stats(self, preprocessor: BaseProcessor):
