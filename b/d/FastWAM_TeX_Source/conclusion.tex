@@ -1,0 +1,5 @@
+\section{Conclusion}
+
+In this paper, we revisited a basic question in World Action Models: whether their gains come primarily from explicit future imagination at test time or from video modeling during training. To study this question, we introduced Fast-WAM, a WAM architecture that retains video co-training during training while skipping future prediction at inference time, enabling direct action generation from world-grounded latent representations.
+Across simulation benchmarks and real-world robotic tasks, Fast-WAM achieves strong performance without embodied pretraining while running in real time. More importantly, controlled comparisons show that Fast-WAM remains competitive with imagine-then-execute variants, whereas removing video co-training leads to a much larger degradation. These results suggest that the main value of video prediction in WAMs may lie more in learning better world representations during training than in generating future observations at test time.
+An important direction for future work is to study the effect of larger-scale pretraining data and model scaling on this design.

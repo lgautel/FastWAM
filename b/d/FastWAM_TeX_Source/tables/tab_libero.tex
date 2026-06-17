@@ -1,0 +1,27 @@
+\begin{table*}[t]
+\centering
+\small
+\caption{Results on LIBERO. Fast-WAM achieves competitive overall performance without embodied pretraining, remains close to both imagine-then-execute variants, and outperforms the no-video-co-training ablation by a clear margin.}
+\label{tab:libero}
+\resizebox{0.95\textwidth}{!}{
+\begin{tabular}{l|c|cccc|c}
+\toprule
+Method & Embodied PT. & Spatial & Object & Goal & Long & \textbf{Average} \\
+\midrule
+OpenVLA~\cite{kim2024openvla} & \cmark & 84.7 & 88.4 & 79.2 & 53.7 & 76.5 \\
+$\pi_0$~\cite{black2024pi_0} & \cmark & 96.8 & 98.8 & 95.8 & 85.2 & 94.1 \\
+$\pi_{0.5}$~\cite{intelligence2025pi_} & \cmark & 98.8 & 98.2 & 98.0 & 92.4 & 96.9 \\
+LingBot-VA~\cite{lingbot-va2026} & \cmark & 98.5 & 99.6 & 97.2 & 98.5 & \textbf{98.5} \\
+Motus~\cite{bi2025motusunifiedlatentaction} & \cmark & 96.8 & 99.8 & 96.6 & 97.6 & \underline{97.7} \\
+\textbf{Fast-WAM (Ours)} & \xmark & 98.2 & 100.0 & 97.0 & 95.2 & 97.6 \\
+\midrule
+\multicolumn{7}{l}{\textit{Fast-WAM Variants}} \\
+\cmidrule(lr){1-7}
+Fast-WAM & \xmark & 98.2 & 100.0 & 97.0 & 95.2 & 97.6 \\
+Fast-WAM-Joint & \xmark & 99.6 & 99.4 & 98.2 & 96.8 & \textbf{98.5} \\
+Fast-WAM-IDM & \xmark & 98.8 & 97.8 & 97.8 & 97.6 & \underline{98.0} \\
+Fast-WAM w.o. video co-train & \xmark & 89.2 & 99.2 & 95.4 & 90.0 & 93.5 \\
+\bottomrule
+\end{tabular}
+}
+\end{table*}

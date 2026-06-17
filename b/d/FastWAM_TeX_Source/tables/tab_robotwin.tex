@@ -1,0 +1,29 @@
+\begin{table}[t]
+\centering
+\small
+\caption{Results on RoboTwin. Fast-WAM matches strong pretrained WAM baselines without using embodied pretraining, while the two imagine-then-execute variants remain highly comparable and removing video co-training causes a substantial drop.}
+\label{tab:robotwin}
+\resizebox{0.8\columnwidth}{!}{
+\begin{tabular}{l|c|cc|c}
+\toprule
+Method & Embodied PT. & Clean & Rand. & \textbf{Average} \\
+\midrule
+% X-VLA & \cmark & 72.80 & 72.84 & 72.8 \\
+$\pi_{0}$~\cite{black2024pi_0} & \cmark & 65.92 & 58.40 & 62.2 \\
+$\pi_{0.5}$~\cite{intelligence2025pi_} & \cmark & 82.74 & 76.76 & 79.8 \\
+Motus~\cite{bi2025motusunifiedlatentaction} & \cmark & 88.66 & 87.02 & 87.8 \\
+Motus from WAN2.2 & \xmark & 77.56 & 77.00 & 77.3 \\
+LingBot-VA~\cite{lingbot-va2026} & \cmark & 92.90 & 91.50  & \textbf{92.2} \\
+LingBot-VA from WAN2.2 & \xmark & 80.60 & -- & 80.6 \\
+\textbf{Fast-WAM (Ours)} & \xmark & 91.88 & 91.78 & \underline{91.8} \\
+\midrule
+\multicolumn{5}{l}{\textit{Fast-WAM Variants}} \\
+\cmidrule(lr){1-5}
+Fast-WAM & \xmark & 91.88 & 91.78 & \textbf{91.8} \\
+Fast-WAM-Joint & \xmark & 90.84 & 90.32 & 90.6 \\
+Fast-WAM-IDM & \xmark & 91.16 & 91.34 & \underline{91.3} \\
+Fast-WAM w.o. video co-train & \xmark & 82.76 & 84.80 & 83.8 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

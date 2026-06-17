@@ -1,0 +1,64 @@
+\section{Experiment}
+\subsection{Implementation Details}
+We use pretrained Wan2.2-5B~\cite{wan2025} as the backbone, including its video DiT, text encoder, and video VAE. The action expert shares the same architecture as the video branch but uses a reduced hidden dimension of $d_a=1024$, resulting in a 1B action expert and a total model size of 6B parameters. We set the action horizon to $h=32$. Video frames are temporally downsampled by $4\times$, resulting in 9 video frames per chunk. Images from multiple cameras are concatenated into a single image before being fed into the VAE.
+
+We use the same flow-matching formulation for both the video and action branches. Following~\cite{wan2025}, we adopt a logit-normal distribution over $t$ as the noise schedule during both training and inference. During inference, we use 10 denoising steps with classifier-free guidance (CFG) scale set to 1.0. We use AdamW with a learning rate of $1\times10^{-4}$, weight decay of 0.01, and a cosine annealing schedule for all training settings. Training is conducted in mixed precision with gradient clipping at 1.0. All latency numbers are measured on a single NVIDIA RTX 5090D V2 32GB GPU.
+
+We build Fast-WAM-Joint by allowing attention between video and action tokens. For Fast-WAM-IDM, we follow~\cite{lingbot-va2026} and apply noise augmentation to the ground-truth video tokens with probability $p=0.5$.
+
+
+
+\subsection{Experiment Setup}
+We evaluate Fast-WAM and its variants on both simulation benchmarks, namely LIBERO~\cite{liu2023libero} and RoboTwin 2.0~\cite{chen2025robotwin}, as well as on a real-world manipulation task.
+
+\paragraph{LIBERO.}
+We follow the standard benchmarking protocol and train our models on the four LIBERO suites: LIBERO-Spatial, LIBERO-Object, LIBERO-Goal, and LIBERO-Long. Each suite contains 500 demonstrations spanning 10 tasks. All models are trained for 20k steps. We report success rates for each suite, evaluated over a total of 2000 trials across 40 tasks with different random seeds.
+
+\paragraph{RoboTwin 2.0.}
+RoboTwin 2.0 is a challenging bimanual manipulation benchmark featuring more than 50 tasks that require coordinated dual-arm control. We follow the multi-task training setup of~\cite{bi2025motusunifiedlatentaction, lingbot-va2026}, where models are trained on a mixture of 2,500 demonstrations collected in clean scenes and 25,000 demonstrations collected under heavy scene randomization, spanning over 50 tasks. All models are trained for 30k steps. We report average success rates over 100 trials per task under both clean and randomized settings.
+
+\begin{figure*}[tbp]
+        \centering
+\includegraphics[width=1.0\textwidth]{figs/bench_grid_2560x720.png} 
+    \caption{Real-world towel-folding task on the Galaxea R1 Lite platform. Folding a deformable object requires long-horizon planning and precise closed-loop manipulation, making it a challenging benchmark for evaluating both task success and execution efficiency.}
+    \label{fig:fold_bench}
+\end{figure*}
+
+\paragraph{Real-World Evaluation.}
+We conduct real-world evaluation on towel folding, a long-horizon and challenging task that requires the policy to reason about the dynamics of deformable objects, as shown in Figure~\ref{fig:fold_bench}. We collect 60 hours of teleoperated demonstrations on the Galaxea R1 Lite platform. All models are trained for 30k steps. We report both the average success rate and the average completion time. The former measures whether the policy can eventually complete the folding task given sufficient time, while the latter reflects whether the policy learns an efficient execution strategy rather than relying on repeated trial-and-error corrections. For this task, completion time is therefore as important as success rate in assessing policy quality.
+
+\subsection{Main Results}
+\subsubsection{Overall comparison on simulation benchmarks}
+
+\input{tables/tab_robotwin}
+\input{tables/tab_libero}
+
+Table~\ref{tab:robotwin} and Table~\ref{tab:libero} summarize the results on RoboTwin and LIBERO, respectively. Overall, Fast-WAM achieves performance comparable to state-of-the-art methods on both benchmarks without using embodied pretraining. Per-task results on RoboTwin are listed in Appendix Table~\ref{tab:robotwin_detail}.
+
+On RoboTwin, Fast-WAM achieves 91.8\% success rate, exceeding all baselines without embodied pretraining and remaining highly competitive with the strongest pretrained WAMs. In particular, Fast-WAM substantially outperforms Motus~\cite{bi2025motusunifiedlatentaction} both with pretraining (87.8\%) and without pretraining (77.3\%), as well as LingBot-VA~\cite{lingbot-va2026} without pretraining (80.6\%), while remaining comparable to pretrained LingBot-VA (92.2\%). These results suggest that Fast-WAM can recover most of the benefit of prior WAM pipelines without relying on embodied pretraining.
+
+On LIBERO, Fast-WAM also delivers strong overall performance, achieving an average success rate of 97.6\% without embodied pretraining. It outperforms the strong VLA baseline $\pi_{0.5}$ and remains competitive with pretrained WAM baselines such as LingBot-VA (98.5\%) and Motus (97.7\%). These results show that Fast-WAM is consistently effective across diverse simulation benchmarks, even without the embodied pretraining used by most prior WAM and VLA baselines.
+
+\subsubsection{Controlled comparison with Fast-WAM variants}
+
+We next compare Fast-WAM with the controlled variants introduced in Sec.~\ref{sec:controlled_variants} to disentangle the role of explicit future imagination at inference time from that of video co-training during training. Across both simulation benchmarks, the overall pattern is consistent: Fast-WAM remains comparable to the two imagine-then-execute variants, while removing video co-training leads to a much larger performance drop.
+
+On RoboTwin, Fast-WAM achieves 91.8\% success rate, which is highly comparable to both Fast-WAM-Joint (90.6\%) and Fast-WAM-IDM (91.3\%). In contrast, removing video co-training reduces performance to 83.8\%, yielding a substantial gap relative to all three variants with video co-training. This result suggests that, on this benchmark, retaining the video modeling objective during training is far more important than explicitly generating future observations at test time. A similar trend holds on LIBERO. Fast-WAM reaches 97.6\% average success rate, remaining close to Fast-WAM-Joint (98.5\%) and Fast-WAM-IDM (98.0\%). By comparison, Fast-WAM without video co-training drops to 93.5\%, with especially visible degradation on the \textit{Spatial} and \textit{Long} subsets. Again, the gap caused by removing video co-training is clearly larger than the gap between Fast-WAM and the imagine-then-execute variants.
+
+This pattern suggests that the main benefit of WAM-style training may lie less in whether, or how, future imagination is performed at test time, and more in the video prediction objective used to shape world-grounded representations during training.
+
+\subsubsection{Real-world performance and efficiency}
+\begin{figure*}[tbp]
+        \centering
+\includegraphics[width=0.95\textwidth]{figs/method_scatter_latency.pdf} 
+    \caption{Real-world results on the long-horizon towel-folding task. The left panel plots success rate against average completion time, where upper-left is better. The right panel compares inference latency. Fast-WAM achieves strong real-world performance with substantially lower latency than imagine-then-execute variants, while removing video co-training degrades both success rate and completion time.}
+    \label{fig:realworld_latency}
+\end{figure*}
+We further evaluate Fast-WAM on a long-horizon real-world towel-folding task. We report both the average success rate and the average completion time, as they capture two equally important aspects of policy quality: whether the policy can eventually complete the task, and whether it does so efficiently rather than through repeated trial-and-error corrections. Results are shown in Figure~\ref{fig:realworld_latency}.
+
+On this task, pretrained $\pi_{0.5}$ remains the strongest method, achieving the highest success rate together with the shortest completion time. Among the Fast-WAM family, the overall performance is comparable, with Fast-WAM-IDM achieving the highest success rate, while Fast-WAM attains a better completion time. Importantly, all Fast-WAM variants with video co-training substantially outperform $\pi_{0.5}$ without pretraining, indicating that WAM-style video co-training provides strong data efficiency even without embodied pretraining.
+
+In contrast, removing video co-training causes a dramatic degradation on both metrics: Fast-WAM without video co-training drops to only 10\% success rate and also requires the longest completion time among all methods. This gap is much larger than the differences among the Fast-WAM variants themselves, suggesting that video co-training is the dominant factor behind strong real-world performance, whereas the effect of test-time future imagination is comparatively limited.
+
+In terms of runtime, Fast-WAM retains low inference latency (190\,ms), whereas the imagine-then-execute variants are substantially slower, especially Fast-WAM-IDM at 810\,ms. This makes Fast-WAM a more favorable design point for real-world deployment, offering strong task performance together with much lower inference cost.
+
