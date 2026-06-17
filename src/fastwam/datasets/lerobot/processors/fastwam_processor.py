@@ -1,15 +1,148 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List, Literal
+import os
+from pathlib import Path
+from typing import Callable, Dict, Any, Optional, List, Literal, Set
 
 import torch
 import numpy as np
 from copy import deepcopy
+from torchvision.io import write_video
 from ..utils.normalizer import LinearNormalizer, NormMode
 from fastwam.utils.pytorch_utils import dict_apply
 from fastwam.utils.logging_config import get_logger
 from .base_processor import BaseProcessor
 
 logger = get_logger(__name__)
+
+_DEFAULT_TRANSFORM_TEST_DIR = (
+    "/home/Luogang/SRC/RL/RLinf/b/test/trnsf_tst"
+)
+EpisodeFrameLoader = Callable[[int, str, int], torch.Tensor]
+_episode_frame_loader: Optional[EpisodeFrameLoader] = None
+_dumped_episodes: Set[int] = set()
+_dump_episode_count = 0
+
+
+def register_episode_frame_loader(loader: Optional[EpisodeFrameLoader]) -> None:
+    """Register a callback that loads full-episode camera frames for MP4 dump."""
+    global _episode_frame_loader
+    _episode_frame_loader = loader
+
+
+def reset_episode_transform_dump_state() -> None:
+    """Reset dump counters (for smoke tests / repeated runs in one process)."""
+    global _dumped_episodes, _dump_episode_count
+    _dumped_episodes = set()
+    _dump_episode_count = 0
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    return int(value)
+
+
+def _lerobot_image_key(meta: Dict[str, Any]) -> str:
+    key = meta["key"]
+    return meta.get("lerobot_key") or (
+        f"observation.images.{key}" if key != "default" else "observation.images"
+    )
+
+
+def _tensor_to_video_u8(image: torch.Tensor) -> torch.Tensor:
+    """Convert ``[T, C, H, W]`` float or uint8 tensor to ``[T, H, W, C]`` uint8."""
+    image = image.detach().cpu()
+    if image.dtype == torch.uint8:
+        return image.permute(0, 2, 3, 1).contiguous()
+    return image.clamp(0.0, 1.0).permute(0, 2, 3, 1).mul(255.0).to(torch.uint8)
+
+
+def dump_episode_transform_mp4(
+    processor: "FastWAMProcessor",
+    episode_index: int,
+    dataset_index: int = 0,
+    *,
+    force: bool = False,
+) -> None:
+    """Dump one full episode (all cameras) with train/val transforms applied.
+
+    Requires ``register_episode_frame_loader`` (wired from ``BaseLerobotDataset``).
+    """
+    global _dump_episode_count
+
+    if _episode_frame_loader is None:
+        raise RuntimeError(
+            "Episode frame loader not registered; call BaseLerobotDataset.set_processor first"
+        )
+    if not force and episode_index in _dumped_episodes:
+        return
+
+    out_dir = Path(
+        os.environ.get("RLINF_TRANSFORM_TEST_DIR", _DEFAULT_TRANSFORM_TEST_DIR)
+    )
+    fps = int(round(float(os.environ.get("FASTWAM_DUMP_TRANSFORM_FPS", "14"))))
+    transforms = processor.train_transforms if processor.is_train else processor.val_transforms
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for meta in processor.shape_meta["images"]:
+        key = meta["key"]
+        lerobot_key = _lerobot_image_key(meta)
+        image = _episode_frame_loader(episode_index, lerobot_key, dataset_index)
+        if image.ndim != 4:
+            raise ValueError(
+                f"Episode loader must return [T, C, H, W], got {tuple(image.shape)}"
+            )
+
+        current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
+        for trans in current_transforms:
+            image = trans(image)
+
+        out_path = out_dir / f"episode_{episode_index:06d}_{key}.mp4"
+        video_u8 = _tensor_to_video_u8(image)
+        write_video(str(out_path), video_u8, fps=fps)
+        logger.info("Dumped episode transform MP4: %s (%d frames)", out_path, video_u8.shape[0])
+
+    _dumped_episodes.add(episode_index)
+    _dump_episode_count += 1
+
+
+def _maybe_dump_episode_transform_mp4(processor: "FastWAMProcessor", data: Dict[str, Any]) -> None:
+    """Dump full-episode augmented videos when enabled during ``preprocess``.
+
+    See ``RLinf/b/test/trnsf_tst/README.md``.
+    """
+    if os.environ.get("FASTWAM_DUMP_TRANSFORM_MP4") != "1":
+        return
+    if _episode_frame_loader is None:
+        return
+
+    episode_index = _to_int(data.get("episode_index"))
+    if episode_index is None:
+        logger.warning("FASTWAM_DUMP_TRANSFORM_MP4 enabled but episode_index missing in sample")
+        return
+    if episode_index in _dumped_episodes:
+        return
+
+    episode_filter = os.environ.get("FASTWAM_DUMP_EPISODE_INDICES", "").strip()
+    if episode_filter:
+        allowed = {int(x.strip()) for x in episode_filter.split(",") if x.strip()}
+        if episode_index not in allowed:
+            return
+
+    max_episodes = int(os.environ.get("FASTWAM_DUMP_TRANSFORM_MAX", "10"))
+    if _dump_episode_count >= max_episodes:
+        return
+
+    dataset_index = _to_int(data.get("dataset_index")) or 0
+    try:
+        dump_episode_transform_mp4(processor, episode_index, dataset_index)
+    except Exception as exc:
+        logger.warning(
+            "Failed to dump episode transform MP4 for episode %s: %s", episode_index, exc
+        )
+
 
 class FastWAMProcessor(BaseProcessor):
     def __init__(
@@ -20,8 +153,6 @@ class FastWAMProcessor(BaseProcessor):
         num_output_cameras: int, 
         action_output_dim: int,
         proprio_output_dim: int,
-
-        action_state_transforms: Optional[List[Any]], 
 
         # action & state normalization
         use_stepwise_action_norm: bool,
@@ -34,6 +165,9 @@ class FastWAMProcessor(BaseProcessor):
         train_transforms: Dict[str, List[Any]] | None,
         val_transforms: Dict[str, List[Any]] | None, 
 
+        action_state_transforms: Optional[List[Any]],
+        proprio_augmentations: Optional[List[Any]] = None,
+        
         # instruction transform
         drop_high_level_prob: float = 1.0,
         use_zh_instruction: bool = False,
@@ -57,6 +191,7 @@ class FastWAMProcessor(BaseProcessor):
         self._is_train = None
 
         self.action_state_transforms = action_state_transforms
+        self.proprio_augmentations = proprio_augmentations
         self.action_state_merger = action_state_merger
         self.action_state_merger.set_shape_meta(self.shape_meta)
 
@@ -223,12 +358,13 @@ class FastWAMProcessor(BaseProcessor):
             current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
             for trans in current_transforms:
                 image = trans(image)
-            
+
             meta_shape = [self.num_obs_steps] + shape
             assert list(image.shape) == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)
+        # _maybe_dump_episode_transform_mp4(self, data) #@#按episode保存训练时被数据增强的图片
         pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
         
         if self.num_output_cameras > pixel_values.shape[0]:
@@ -258,6 +394,9 @@ class FastWAMProcessor(BaseProcessor):
                     pad_delta_mask = cur_action_is_pad.unsqueeze(1) & cur_dim_mask.unsqueeze(0)
                     cur_action[pad_delta_mask] = 0.0
         data = self.action_state_transform(data)
+        if self.is_train and self.proprio_augmentations is not None:
+            for aug in self.proprio_augmentations:
+                data = aug(data)
         data = self.normalizer.forward(data)
         data = self.action_state_merger.forward(data)
 

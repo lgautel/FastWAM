@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from typing import Dict, Optional
 
 import torch
@@ -9,6 +10,46 @@ from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class _ExpertMixtures(Mapping[str, nn.Module]):
+    """Hold expert modules by name without registering them on the parent MoT.
+
+    Mirrors ``nn.ModuleDict`` attribute access (``mixtures.video``) for FSDP/DCP
+    FQN resolution and FastWAM ``mot`` checkpoints, while keeping experts
+    registered only under ``FastWAM.video_expert`` / ``FastWAM.action_expert``.
+    """
+
+    def __init__(self, mixtures: Dict[str, nn.Module]) -> None:
+        self._modules = dict(mixtures)
+
+    def __getitem__(self, key: str) -> nn.Module:
+        return self._modules[key]
+
+    def __getattr__(self, name: str) -> nn.Module:
+        if name == "_modules":
+            return object.__getattribute__(self, "_modules")
+        modules = object.__getattribute__(self, "_modules")
+        if name in modules:
+            return modules[name]
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._modules
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._modules)
+
+    def __len__(self) -> int:
+        return len(self._modules)
+
+    def keys(self):
+        return self._modules.keys()
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self._modules.keys()))
 
 
 class MoT(nn.Module):
@@ -23,7 +64,7 @@ class MoT(nn.Module):
         if "video" not in mixtures or "action" not in mixtures:
             raise ValueError("`mixtures` must include both 'video' and 'action' experts.")
 
-        self.mixtures = nn.ModuleDict(mixtures)
+        self.mixtures = _ExpertMixtures(mixtures)
         self.expert_order = list(self.mixtures.keys())
         self.mot_checkpoint_mixed_attn = mot_checkpoint_mixed_attn
         if mot_checkpoint_mixed_attn:
@@ -54,6 +95,40 @@ class MoT(nn.Module):
         for name in self.expert_order:
             expert = self.mixtures[name]
             logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
+
+    def parameters(self, recurse: bool = True):
+        if not recurse:
+            return iter(())
+        for name in self.expert_order:
+            yield from self.mixtures[name].parameters()
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        if destination is None:
+            destination = {}
+        for name in self.expert_order:
+            expert = self.mixtures[name]
+            for key, value in expert.state_dict(
+                prefix=f"{prefix}mixtures.{name}.", keep_vars=keep_vars
+            ).items():
+                destination[key] = value
+        return destination
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        missing_keys = []
+        unexpected_keys = []
+        for name in self.expert_order:
+            expert_prefix = f"mixtures.{name}."
+            sub_state = {
+                key[len(expert_prefix) :]: value
+                for key, value in state_dict.items()
+                if key.startswith(expert_prefix)
+            }
+            if not sub_state:
+                continue
+            incompatible = expert.load_state_dict(sub_state, strict=strict)
+            missing_keys.extend(incompatible.missing_keys)
+            unexpected_keys.extend(incompatible.unexpected_keys)
+        return torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
