@@ -114,7 +114,7 @@ data/libero_mujoco3.3.2/
 
 ### RoboTwin
 
-Fast-WAM 使用的 RoboTwin 预处理数据已发布到：
+Fast-WAM 使用的 RoboTwin 预处理数据已发布到： #@#??? 是2.0吗?做了些什么处理?原始的有何不同?
 
 - https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam
 

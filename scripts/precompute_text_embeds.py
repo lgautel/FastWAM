@@ -237,7 +237,7 @@ def main(cfg: DictConfig):
         "wan_video_text_encoder",
         torch_dtype=torch_dtype,
         device=device,
-    ).eval()
+    ).eval()#@# 其实就是用 fastwam/models/wan22/wan_video_text_encoder.py/WanTextEncoder 去运行 DiffSynth-Studio/Wan-Series-Converted-Safetensors 里的 models_t5_umt5-xxl-enc-bf16.safetensors
     tokenizer = HuggingfaceTokenizer(
         name=tokenizer_config.path,
         seq_len=context_len,
