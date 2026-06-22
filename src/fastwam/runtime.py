@@ -369,7 +369,7 @@ def run_training(cfg: DictConfig):
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device) #@# -> create_fastwam/_joint/_idm
     train_ds, val_ds = build_datasets(cfg.data)
 
     trainer = Wan22Trainer(

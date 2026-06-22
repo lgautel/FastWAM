@@ -19,6 +19,13 @@
 8. [代码导航手册](#8-代码导航手册)
 9. [讨论与展望](#9-讨论与展望)
 10. [参考文献](#10-参考文献)
+11. [论文-代码对照分析](#11-论文-代码对照分析)
+12. [训练 Pipeline 深度拆解](#12-训练-pipeline-深度拆解)
+13. [DreamZero SFT 在 RLinf 中的深度解析](#13-dreamzero-sft-在-rlinf-中的深度解析)
+14. [FastWAM 模块别名：video_expert / action_expert 与 mot / dit 是否重复](#14-fastwam-模块别名video_expert--action_expert-与-mot--dit-是否重复)
+15. [文本条件与 Cross-Attention 全解析](#15-文本条件与-cross-attention-全解析)
+16. [Flow Matching 调度器与时间步全解析](#16-flow-matching-调度器与时间步全解析)
+17. [FastWAM 的 Video/Action Flow Matching 全链路](#17-fastwam-的-videoaction-flow-matching-全链路)
 
 ---
 
@@ -3670,3 +3677,2496 @@ flowchart TB
 ```
 
 这套集成设计体现了 RLinf 的核心理念：**框架提供训练基础设施，模型保持独立性**。通过四个清晰的集成接缝（注册、工厂、分发、接口）和非侵入式的 Patcher 机制，RLinf 能够以最小的上游修改接入 DreamZero、OpenPI、GR00T 等不同的第三方 VLA 模型，同时为所有模型提供统一的分布式训练、checkpoint 管理和评估能力。
+
+---
+
+## 14. FastWAM 模块别名：video_expert / action_expert 与 mot / dit 是否重复
+
+### 14.0 结论先行
+
+`video_expert` / `action_expert` 与 `mot` / `dit` 之间**不是副本，而是别名（aliasing）—— 内存里只有一份权重**。但它们被注册在 `FastWAM` 的多条属性路径上，这带来一个关键的非对称行为：`parameters()` 会去重，而 `state_dict()` 不会去重。
+
+用最小复现脚本实测了这个别名结构，证据如下：
+
+```text
+video_expert IS mot.mixtures.video : True
+dit IS mot                         : True
+unique params via parameters()      : 4     # 去重
+keys via named_parameters() (dedup) : 4     # 去重
+keys via state_dict() top (NO dedup): 12    # 3x 膨胀!
+keys via mot.state_dict()           : 4     # 干净
+distinct storage tensors in state_dict: 4 / total keys 12   # 12个key只指向4份真实显存
+```
+
+---
+
+### 14.1 引用关系
+
+```43:47:src/fastwam/models/wan22/fastwam.py
+        self.video_expert = video_expert
+        self.action_expert = action_expert
+        self.mot = mot
+        # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
+        self.dit = self.mot
+```
+
+而 `MoT` 内部把同一批 expert 又存了一遍：
+
+```26:26:src/fastwam/models/wan22/mot.py
+        self.mixtures = nn.ModuleDict(mixtures)
+```
+
+其中 `mixtures = {"video": video_expert, "action": action_expert}`（`fastwam.py:147-150`），是**传进来的同一对象**。
+
+```mermaid
+graph TD
+  subgraph refs ["FastWAM._modules 的 4 条引用"]
+    VE[video_expert]
+    AE[action_expert]
+    MOT[mot]
+    DIT[dit]
+  end
+  WV["WanVideoDiT 对象<br/>(唯一一份权重)"]
+  AD["ActionDiT 对象<br/>(唯一一份权重)"]
+  MOTOBJ["MoT 对象"]
+  VE --> WV
+  AE --> AD
+  MOT --> MOTOBJ
+  DIT --> MOTOBJ
+  MOTOBJ -->|"mixtures.video"| WV
+  MOTOBJ -->|"mixtures.action"| AD
+```
+
+所以一个 WanVideoDiT 可经 3 条路径访问：`model.video_expert`、`model.mot.mixtures.video`、`model.dit.mixtures.video`；ActionDiT 同理。`model.dit` 和 `model.mot` 则是同一个 MoT。
+
+---
+
+### 14.2 是否有多份副本？——没有
+
+- **显存/内存**：只有一份。实测 12 个 `state_dict` key 只对应 **4 份真实 storage**（`data_ptr` 去重后）。
+- 任何一条路径上 `.to(device)`、改 `requires_grad`、写入权重，其余路径**立即同步**，因为是同一个 Python 对象。
+
+---
+
+### 14.3 对训练的影响
+
+#### 14.3.1 optimizer 参数收集 —— 安全，不会重复更新
+
+```85:88:src/fastwam/trainer.py
+        trainable_params = list(self.model.dit.parameters())
+        proprio_encoder = getattr(self.model, "proprio_encoder", None)
+        if proprio_encoder is not None:
+            trainable_params.extend(list(proprio_encoder.parameters()))
+```
+
+`dit.parameters()`（即 `mot.parameters()`）默认 `remove_duplicate=True`，实测返回 **4** 个唯一参数。即使 `mot` 内部对 video/action 各持一个引用，也只各产出一次。**optimizer 不会拿到重复参数，因此不会出现"同一权重被更新两次/动量翻倍"的 bug**。
+
+> 反例提醒：若改写成 `list(model.video_expert.parameters()) + list(model.dit.parameters())`，video 会被算两次 —— 当前代码刻意避免了。
+
+#### 14.3.2 冻结/解冻 —— 别名让 video expert 也变可训练（即 video co-training）
+
+```287:295:src/fastwam/trainer.py
+    def _apply_dit_only_train_mode(model):
+        model.eval()
+        model.requires_grad_(False)
+        model.dit.train()
+        model.dit.requires_grad_(True)
+        proprio_encoder = getattr(model, "proprio_encoder", None)
+        if proprio_encoder is not None:
+            proprio_encoder.train()
+            proprio_encoder.requires_grad_(True)
+```
+
+- `model.requires_grad_(False)` 走去重遍历，先冻结所有参数。
+- `model.dit.requires_grad_(True)` 因为 `dit==mot`，会把 **video_expert 和 action_expert 同时解冻** —— 这正是论文里 video co-training 的来源（视频专家不是冻结的，而是和动作专家一起训练）。
+- `model.eval()` + `model.dit.train()` 也借别名只需操作一处：`video_expert.training` 等会自动同步，**不会出现某条路径还停在 eval、另一条在 train 的割裂**。
+- 注意：因此"关闭 video co-train"不能靠这里冻结，要靠 `loss.lambda_video=0`；但即便如此，video expert 的参数仍可能通过 MoT mixed-attention 的 K/V 投影从 action loss 收到梯度。
+
+#### 14.3.3 梯度裁剪 —— 安全
+
+```678:678:src/fastwam/trainer.py
+                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+```
+
+`model.parameters()` 去重，冻结参数无 `.grad` 被跳过，video expert 只计入一次范数，**不会因别名把它的梯度范数算两遍**。
+
+#### 14.3.4 权重 checkpoint 保存 —— 干净，规避了 3x 膨胀
+
+```1088:1098:src/fastwam/models/wan22/fastwam.py
+    def save_checkpoint(self, path, optimizer=None, step=None):
+        payload = {
+            "mot": self.mot.state_dict(),
+            "step": step,
+            "torch_dtype": str(self.torch_dtype),
+        }
+        if self.proprio_encoder is not None:
+            payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        ...
+        torch.save(payload, path)
+```
+
+保存的是 `self.mot.state_dict()`（实测 **4** key，只有 `mixtures.video.*` / `mixtures.action.*`），不是 `model.state_dict()`（那会是 **12** key）。而且用 `torch.save` 而非 safetensors。**所以正式权重文件既不膨胀也不报错。**
+
+#### 14.3.5 真正的潜在隐患 —— `accelerator.save_state` 的完整状态
+
+```594:594:src/fastwam/trainer.py
+        self.accelerator.save_state(output_dir=state_path)
+```
+
+这一步保存用于断点续训的完整 model+optimizer 状态：
+
+- **DeepSpeed ZeRO-1/2 路径（项目默认 `train_zero1.sh`/`train_zero2.sh`）**：由 DeepSpeed 引擎按去重后的参数分片保存，别名**不影响**。
+- **但若在纯单卡 Accelerate + safetensors 序列化下**：`model.state_dict()` 含 12 个 key 指向 4 份共享 storage，而 **safetensors 不允许多个 key 共享内存**，会触发报错或自动去重告警。这是别名结构唯一需要警惕的真实风险点。
+
+---
+
+### 14.4 对推理的影响
+
+#### 14.4.1 前向混用两条路径，但权重必然同步
+
+推理/前向里，输入嵌入和输出头走 expert 路径，而 transformer blocks 走 mot 路径：
+
+```479:532:src/fastwam/models/wan22/fastwam.py
+        video_pre = self.video_expert.pre_dit(...)
+        action_pre = self.action_expert.pre_dit(...)
+        ...
+        tokens_out = self.mot(...)
+        ...
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+```
+
+而 `mot` 内部 blocks 用的是 `self.mixtures[name].blocks`（`mot.py:298,390,480`）。由于 `mixtures.video is video_expert`，**`pre_dit → blocks → post_dit` 三段用的是同一对象的不同部分，绝不会出现 pre/post 用新权重、blocks 用旧权重的不同步问题**。这其实正是这套别名设计的必要性：`mot` 需要 experts 跑 mixed-attention，而 `FastWAM` 顶层需要 experts 的 `pre_dit`/`post_dit`（这两个方法不在 `mot.forward` 里）。
+
+#### 14.4.2 `infer_action` + KV cache
+
+```711:723:src/fastwam/models/wan22/fastwam.py
+        action_tokens = self.mot.forward_action_with_video_cache(...)
+        ...
+        return self.action_expert.post_dit(action_tokens, action_pre)
+```
+
+prefill 阶段 `self.mot.prefill_video_cache(...)` 配 `self.video_expert.pre_dit`（`fastwam.py:998,1013`）。视频分支缓存为 KV、动作迭代去噪，全程同一份权重，别名保证缓存与后续计算一致。
+
+#### 14.4.3 加载 checkpoint —— 一次加载，三路同步
+
+```1100:1106:src/fastwam/models/wan22/fastwam.py
+    def load_checkpoint(self, path, optimizer=None):
+        payload = torch.load(path, map_location="cpu")
+        if "mot" in payload:
+            self.mot.load_state_dict(payload["mot"], strict=False)
+        elif "dit" in payload:
+            logger.warning("Loading legacy `dit` checkpoint into video expert only.")
+            self.video_expert.load_state_dict(payload["dit"], strict=False)
+```
+
+只需 `self.mot.load_state_dict(...)`，因为别名，`model.video_expert` / `model.action_expert` / `model.dit` 同时被更新，**不需要、也不应该再分别加载**（重复加载只是冗余、不会出错）。
+
+#### 14.4.4 设备迁移
+
+`fastwam.py:185` 的 `self.mot.to(...)` 会一并移动两个 expert（别名同步），不会出现"`model.video_expert` 在 GPU、`model.mot.mixtures.video` 在 CPU"这种割裂。
+
+---
+
+### 14.5 维护注意事项（避免把"安全的别名"变成"危险的重复"）
+
+- 不要把保存逻辑从 `mot.state_dict()` 改成 `model.state_dict()`，否则 key 3x 膨胀、且 safetensors 报共享内存错。
+- 不要用 `video_expert.parameters() + dit.parameters()` 拼 optimizer 参数（会重复）。
+- 单卡 + safetensors 续训时，注意 `save_state` 的共享 tensor 问题；多卡 DeepSpeed 无此问题。
+- `fastwam2.py` 是"去重复嵌套"的备用实现（`self.mot = MoT(...)` 不再额外存 `video_expert`/`action_expert` 为顶层属性），是针对这一结构的简化版，但非主用。
+
+当前主实现（`fastwam.py` + `trainer.py`）在训练和推理上都是**正确且安全**的，无需改动 —— 别名带来的只是 `state_dict` 顶层 key 冗余这一个表象，而真正写盘和喂给 optimizer 的路径都已正确去重。
+
+---
+
+### 14.6 transformer blocks 走 self.mot.mixtures[...] 的代码体现
+
+第 14.4.1 节提到「输入嵌入和输出头走 expert 路径，而 transformer blocks 走 mot 路径」。这句话不是抽象描述，而是有明确代码落点的：**MoT 并不自己定义 Transformer block，而是每层从 `self.mixtures[name]` 取出 expert，再访问 `expert.blocks[layer_idx]` 做 mixed-attention 与 MLP**。
+
+#### 14.6.1 入口：`FastWAM` 只把 token 交给 `self.mot`
+
+训练时，`pre_dit` 在 expert 上完成，`blocks` 在 `mot` 上完成：
+
+```479:532:src/fastwam/models/wan22/fastwam.py
+        video_pre = self.video_expert.pre_dit(
+            x=latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+        )
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        video_tokens = video_pre["tokens"]
+        action_tokens = action_pre["tokens"]
+
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_tokens.shape[1],
+            action_seq_len=action_tokens.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_tokens.device,
+        )
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_tokens,
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+        )
+
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+```
+
+对应关系：
+
+| 阶段 | 调用对象 | 做什么 |
+|------|----------|--------|
+| 嵌入 / 输出头 | `video_expert` / `action_expert` | `pre_dit` / `post_dit` |
+| 30 层 Transformer | `self.mot` → `mixtures[...].blocks` | mixed-attention + MLP |
+
+#### 14.6.2 核心：`MoT.forward()` 里按层取 `mixtures[name].blocks`
+
+训练/联合前向的主路径在 `MoT.forward()`：
+
+```472:481:src/fastwam/models/wan22/mot.py
+        for layer_idx in range(self.num_layers):
+            q_chunks = []
+            k_chunks = []
+            v_chunks = []
+            cached = {}
+            seq_lens = []
+
+            for name in self.expert_order:
+                expert = self.mixtures[name]
+                block = expert.blocks[layer_idx]
+                x = tokens_all[name]
+```
+
+`expert_order` 默认是 `["video", "action"]`，所以这里等价于：
+
+- `self.mixtures["video"].blocks[layer_idx]` → video 的 DiT block
+- `self.mixtures["action"].blocks[layer_idx]` → action 的 DiT block
+
+每层 block 用来算 Q/K/V、做 mixed-attention、再过 MLP：
+
+```163:171:src/fastwam/models/wan22/mot.py
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
+        attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
+
+        q = block.self_attn.norm_q(block.self_attn.q(attn_input))
+        k = block.self_attn.norm_k(block.self_attn.k(attn_input))
+        v = block.self_attn.v(attn_input)
+
+        q = rope_apply(q, freqs, block.num_heads)
+        k = rope_apply(k, freqs, block.num_heads)
+```
+
+mixed-attention 输出再写回各 expert 的 token（仍用同一个 `block`）：
+
+```533:553:src/fastwam/models/wan22/mot.py
+            for name, seq_len in zip(self.expert_order, seq_lens):
+                # 4. split mixed attention output and apply post-attention blocks for each expert
+                end = start + seq_len
+                mixed_slice = mixed[:, start:end, :]
+                cached_expert = cached[name]
+                block = cached_expert["block"]
+                context_payload = context_all.get(name)
+
+                updated_tokens = self._apply_post_with_optional_checkpoint(
+                    block=block,
+                    residual_x=cached_expert["residual_x"],
+                    gate_msa=cached_expert["gate_msa"],
+                    shift_mlp=cached_expert["shift_mlp"],
+                    scale_mlp=cached_expert["scale_mlp"],
+                    gate_mlp=cached_expert["gate_mlp"],
+                    use_gradient_checkpointing=cached_expert["use_gradient_checkpointing"],
+                    mixed_slice=mixed_slice,
+                    context_payload=context_payload,
+                )
+
+                tokens_all[name] = updated_tokens
+                start = end
+```
+
+**这就是「blocks 走 `self.mot.mixtures[...]`」的直接代码体现。**
+
+#### 14.6.3 推理两条子路径：同样走 `mixtures`
+
+**Video KV prefill（`infer_action`）**
+
+```298:302:src/fastwam/models/wan22/mot.py
+        expert = self.mixtures["video"]
+        x = video_tokens
+        kv_cache: list[dict[str, torch.Tensor]] = []
+        for layer_idx in range(self.num_layers):
+            block = expert.blocks[layer_idx]
+```
+
+`FastWAM` 侧调用：
+
+```1013:1022:src/fastwam/models/wan22/fastwam.py
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+```
+
+**Action 去噪（复用 video KV）**
+
+```390:393:src/fastwam/models/wan22/mot.py
+        expert = self.mixtures["action"]
+        x = action_tokens
+        for layer_idx in range(self.num_layers):
+            block = expert.blocks[layer_idx]
+```
+
+`FastWAM` 侧调用：
+
+```711:722:src/fastwam/models/wan22/fastwam.py
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+```
+
+#### 14.6.4 为何和 `video_expert` 是同一套 block？
+
+构造时传入的是**同一对象**：
+
+```147:150:src/fastwam/models/wan22/fastwam.py
+        mot = MoT(
+            mixtures={"video": video_expert, "action": action_expert},
+            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+        )
+```
+
+MoT 内部：
+
+```26:26:src/fastwam/models/wan22/mot.py
+        self.mixtures = nn.ModuleDict(mixtures)
+```
+
+因此：
+
+```python
+model.video_expert.blocks[i] is model.mot.mixtures["video"].blocks[i]  # True
+model.action_expert.blocks[i] is model.mot.mixtures["action"].blocks[i]  # True
+```
+
+`pre_dit → blocks → post_dit` 三段用的是同一对象的不同部分，绝不会出现 pre/post 用新权重、blocks 用旧权重的不同步问题。这也正是别名设计的必要性：`mot` 需要 experts 跑 mixed-attention，而 `FastWAM` 顶层需要 experts 的 `pre_dit`/`post_dit`（这两个方法不在 `mot.forward` 里）。
+
+#### 14.6.5 调用链总览
+
+```mermaid
+flowchart TB
+  subgraph FastWAM ["FastWAM.forward / training_loss"]
+    PreV["video_expert.pre_dit"]
+    PreA["action_expert.pre_dit"]
+    MoTCall["self.mot(...)"]
+    PostV["video_expert.post_dit"]
+    PostA["action_expert.post_dit"]
+  end
+
+  subgraph MoTInner ["MoT 内部 per layer"]
+    GetExpert["expert = self.mixtures[name]"]
+    GetBlock["block = expert.blocks[layer_idx]"]
+    MixedAttn["mixed attention + block MLP"]
+  end
+
+  PreV --> MoTCall
+  PreA --> MoTCall
+  MoTCall --> GetExpert --> GetBlock --> MixedAttn
+  MixedAttn --> PostV
+  MixedAttn --> PostA
+```
+
+**一句话总结**：`self.mot.mixtures[...]` 不是抽象说法，就是 [`mot.py`](src/fastwam/models/wan22/mot.py) 里 `forward`（L479–481）、`prefill_video_cache`（L298–302）、`forward_action_with_video_cache`（L390–393）三处 `expert = self.mixtures[...]` + `block = expert.blocks[layer_idx]`；`FastWAM` 只负责在前后包一层 `pre_dit` / `post_dit`。
+
+---
+
+### 14.7 MoT 入参：embeds_all / freqs_all / t_mod_all 的数据来源与处理链路
+
+`MoT.forward()` 在 L455–463 校验的三个 dict——`embeds_all`、`freqs_all`、`t_mod_all`——**不是 DataLoader batch 里直接存在的字段**，而是 `FastWAM.training_loss()` 里先对 batch 做 `pre_dit`，再把两个 expert 的输出打包传给 MoT 的。
+
+#### 14.7.1 总览：从数据到 MoT
+
+```mermaid
+flowchart TB
+  subgraph Dataset ["RobotVideoDataset batch"]
+    V["video [B,3,T,H,W]"]
+    A["action [B,Ta,Da]"]
+    C["context [B,L,4096]"]
+    CM["context_mask [B,L]"]
+  end
+
+  subgraph BuildInputs ["FastWAM.build_inputs()"]
+    VAE["VAE.encode → input_latents"]
+    Proprio["可选 proprio → 拼进 context"]
+  end
+
+  subgraph FlowMatch ["training_loss 内采样噪声"]
+    TV["timestep_video + noisy latents"]
+    TA["timestep_action + noisy_action"]
+  end
+
+  subgraph PreDit ["各 expert.pre_dit()"]
+    VP["video_pre: tokens, freqs, t_mod, ..."]
+    AP["action_pre: tokens, freqs, t_mod, ..."]
+  end
+
+  subgraph MoTIn ["MoT.forward() 入参"]
+    E["embeds_all"]
+    F["freqs_all"]
+    T["t_mod_all"]
+  end
+
+  V --> VAE
+  A --> FlowMatch
+  C --> PreDit
+  VAE --> FlowMatch
+  FlowMatch --> PreDit
+  VP --> E
+  AP --> E
+  VP --> F
+  AP --> F
+  VP --> T
+  AP --> T
+```
+
+组装代码在 `fastwam.py`：
+
+```504:527:src/fastwam/models/wan22/fastwam.py
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_tokens,
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+        )
+```
+
+其中 `video_tokens = video_pre["tokens"]`，`action_tokens = action_pre["tokens"]`。
+
+#### 14.7.2 三者对照表
+
+| 参数 | 含义 | 典型形状 | 原始数据 | 生成方式 |
+|------|------|----------|----------|----------|
+| `embeds_all["video"]` | 视频 latent 的 patch token | `[B, Sv, D_v]` | `sample["video"]` | VAE 编码 → flow matching 加噪 → `patchify` → flatten |
+| `embeds_all["action"]` | 动作 token | `[B, Sa, D_a]` | `sample["action"]` | 归一化动作 → 加噪 → `Linear(action_dim→hidden)` |
+| `freqs_all["video"]` | 3D 时空 RoPE | `[Sv, 1, rope_dim]` | 视频 latent 的 `(F,H,W)` 网格 | 从预计算 `self.freqs[0/1/2]` 按 grid 组合 |
+| `freqs_all["action"]` | 1D 时序 RoPE | `[Sa, 1, rope_dim]` | action 序列长度 `T_a` | `self.freqs[:seq_len]` 切片 |
+| `t_mod_all["video"]` | 视频扩散 timestep 的 AdaLN 调制 | `[B, Sv, 6, D_v]` | **训练时随机采样**的 `timestep_video` | 正弦嵌入 → time MLP → 6 路 shift/scale/gate |
+| `t_mod_all["action"]` | 动作扩散 timestep 的 AdaLN 调制 | `[B, 6, D_a]` | **训练时随机采样**的 `timestep_action` | 同上，整段 action 共享一组 t |
+
+#### 14.7.3 embeds_all —— 进入 Transformer 的 token 序列
+
+**Video 分支**
+
+数据链：
+
+1. **Dataset**：多相机图像 → resize/crop/normalize → `[B, 3, T, H, W]`
+2. **`build_inputs`**：`VAE.encode(video)` → `input_latents` `[B, 48, F, H/8, W/8]`
+3. **`training_loss`**：采样 `timestep_video`，`add_noise` 得到 `latents`；首帧可替换为 clean latent（`fuse_vae_embedding_in_latents`）
+4. **`video_expert.pre_dit(x=latents, ...)`**：
+
+```555:609:src/fastwam/models/wan22/wan_video_dit.py
+        x = self.patchify(x, control_camera_latents_input=control_camera_latents_input)
+        f, h, w = x.shape[2:]
+
+        context = self.text_embedding(context) # (B, L, dim)
+        ...
+        x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
+
+        freqs = torch.cat([
+            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+
+        return {
+            "tokens": x_tokens,
+            "freqs": freqs,
+            ...
+        }
+```
+
+`embeds_all["video"]` 就是 `x_tokens`：**把 noisy 视频 latent 切成 patch 后展平成 token 序列**。
+
+**Action 分支**
+
+数据链：
+
+1. **Dataset**：LeRobot 原始 action → processor 归一化 → `[B, T_a, action_dim]`
+2. **`training_loss`**：采样 `timestep_action`，`noisy_action = add_noise(action, ...)`
+3. **`action_expert.pre_dit(action_tokens=noisy_action, ...)`**：
+
+```283:289:src/fastwam/models/wan22/action_dit.py
+        tokens = self.action_encoder(action_tokens)
+        context_emb = self.text_embedding(context)
+        context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
+        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+
+        return {
+            "tokens": tokens,
+```
+
+`embeds_all["action"]` = `Linear(noisy_action)` 的输出。
+
+MoT 里直接当每层 block 的输入 `x`：
+
+```482:482:src/fastwam/models/wan22/mot.py
+                x = tokens_all[name]
+```
+
+#### 14.7.4 freqs_all —— RoPE 位置编码
+
+**Video**：3D 时空 RoPE，`(f,h,w)` 由 **VAE latent 的空间尺寸 + 帧数** 决定，与 `video` 的时空结构绑定，不是从 dataset 单独读一个字段。
+
+**Action**：1D 时序 RoPE，`seq_len = action.shape[1]`，即 action chunk 长度（如 RobotWin 配置里 `num_frames-1=32`）。
+
+MoT 里用于 Q/K 的 RoPE：
+
+```170:171:src/fastwam/models/wan22/mot.py
+        q = rope_apply(q, freqs, block.num_heads)
+        k = rope_apply(k, freqs, block.num_heads)
+```
+
+```483:484:src/fastwam/models/wan22/mot.py
+                freqs = freqs_all[name]
+                t_mod = t_mod_all[name]
+```
+
+#### 14.7.5 t_mod_all —— 扩散时间步的 AdaLN 调制
+
+**注意**：`t_mod` **不来自 dataset**，而是 flow matching 训练里每 step 随机采的扩散时间 \(t\)。
+
+采样发生在 `training_loss`：
+
+```459:476:src/fastwam/models/wan22/fastwam.py
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=input_latents.dtype,
+        )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        ...
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+```
+
+**Video（per-token，首帧 t=0）**
+
+```541:550:src/fastwam/models/wan22/wan_video_dit.py
+            token_timesteps = torch.ones(
+                (batch_size, x.shape[2], tokens_per_frame),
+                dtype=timestep.dtype,
+                device=timestep.device,
+            ) * timestep.view(batch_size, 1, 1)
+            token_timesteps[:, 0, :] = 0
+            token_timesteps = token_timesteps.reshape(batch_size, -1)
+            token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
+            t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
+            t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
+```
+
+与 `fuse_vae_embedding_in_latents` 配合：首帧是 clean conditioning，其余帧带噪声 timestep。
+
+**Action（整段共享）**
+
+```280:281:src/fastwam/models/wan22/action_dit.py
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
+        t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
+```
+
+MoT 里用于 AdaLN：
+
+```163:164:src/fastwam/models/wan22/mot.py
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
+        attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
+```
+
+video 的 `t_mod` 是 4D → 每个 token 不同调制；action 是 3D → 该 expert 所有 token 同一组调制。
+
+#### 14.7.6 与 context 的区分
+
+`context` / `context_mask` **不在** `embeds_all/freqs_all/t_mod_all` 里，而是单独通过 `context_all` 传入 MoT，用于 **cross-attention**（文本条件）。
+
+数据侧：
+
+```222:233:src/fastwam/datasets/lerobot/robot_video_dataset.py
+        context, context_mask = self._get_cached_text_context(instruction)
+        ...
+        data = {
+            "video": video,
+            "action": action,
+            "proprio": proprio,
+            "prompt": instruction,
+            "context": context,
+            "context_mask": context_mask,
+            ...
+        }
+```
+
+- 来自 `tasks.jsonl` 的 instruction → T5 预计算缓存 `[L, 4096]`
+- `pre_dit` 里再经 `text_embedding` 投到 hidden dim，并 expand 成 per-token 的 cross-attn mask
+- 可选 proprio 在 `build_inputs` 里拼进 `context`（`proprio_encoder` + append）
+
+#### 14.7.7 完整处理链与 MoT 内消费
+
+```text
+sample["video"]     → VAE → latents → +noise(t_v) → patchify        → embeds_all["video"]
+sample["action"]    → normalize → +noise(t_a) → action_encoder      → embeds_all["action"]
+
+latent grid (F,H,W) → 3D RoPE 组合                                    → freqs_all["video"]
+action len T_a      → freqs[:T_a]                                     → freqs_all["action"]
+
+random t_v (flow)   → time embed (首帧=0)                           → t_mod_all["video"]
+random t_a (flow)   → time embed                                      → t_mod_all["action"]
+
+sample["context"]   → text_embedding in pre_dit                     → context_all (cross-attn)
+```
+
+`mot.py:455-463` 只是校验 `"video"` / `"action"` 三个 dict 的 key 是否齐全；真正消费在循环内：
+
+```479:501:src/fastwam/models/wan22/mot.py
+            for name in self.expert_order:
+                expert = self.mixtures[name]
+                block = expert.blocks[layer_idx]
+                x = tokens_all[name]      # ← embeds_all[name]
+                freqs = freqs_all[name]   # ← RoPE
+                t_mod = t_mod_all[name]   # ← 扩散时间调制
+                (
+                    q,
+                    k,
+                    v,
+                    ...
+                ) = self._build_expert_attention_io(
+                    expert=expert,
+                    block=block,
+                    x=x,
+                    freqs=freqs,
+                    t_mod=t_mod,
+                )
+```
+
+**一句话总结**：
+
+- **`embeds_all`**：视频/动作经 VAE+噪声+embedding 后的 **Transformer 输入 token**
+- **`freqs_all`**：与视频时空网格、动作序列长度对应的 **RoPE**
+- **`t_mod_all`**：flow matching 随机时间步产生的 **AdaLN 调制**（不是 dataset 字段）
+
+三者都是 `pre_dit` 的产物；MoT 只负责在 mixed-attention 里消费它们，不再做 patch/编码/时间嵌入。
+
+---
+
+## 15. 文本条件与 Cross-Attention 全解析
+
+> 本章承接 14.7 节末尾留下的伏笔——「`context` / `context_mask` 不在 `embeds_all/freqs_all/t_mod_all` 里，而是单独通过 `context_all` 传入 MoT 用于 cross-attention」——系统梳理文本条件的**来源、处理、使用**，并以科普论文的笔法讲清 cross-attention 的**原理、实现、动机**以及它贯穿的**训练与推理全流程**。
+
+### 15.1 引子：一条指令如何「钻进」每一层 Transformer
+
+设想真机折叠毛巾任务里的一条指令：
+
+> *"fold the towel on the table"*
+
+FastWAM 要据此生成未来视频 latent 与一段动作 chunk。问题是：这串文本经过怎样的旅程，才能在 30 层 Transformer 的**每一层**都持续影响视频像素与机器人动作？
+
+答案的核心就是 **cross-attention（交叉注意力）**：文本被 T5 编码成一组「记忆向量」，模型的每个视频/动作 token 在每一层都向这组记忆「提问」，把语义抽取进来。下面从数据源头讲起。
+
+### 15.2 context / context_mask 是什么、从哪来（数据侧）
+
+**第一步：指令模板化。** 数据集把原始 task 描述套进一个固定模板：
+
+```23:23:src/fastwam/datasets/lerobot/robot_video_dataset.py
+DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+```
+
+这种「视角前缀 + 指令」的写法是为了贴合 Wan2.2 视频生成骨干的预训练分布（它见过大量「某视角拍摄的视频」式 caption）。
+
+**第二步：T5 离线编码并缓存。** FastWAM 训练时**不在线跑 T5**，而是用 `scripts/precompute_text_embeds.py` 预先把每条 instruction 编码成定长向量，落盘成缓存文件 `{sha256(prompt)}.t5_len128.wan22ti2v5b.pt`，内含 `context`（形状 `[L, 4096]`）与 `mask`（形状 `[L]`），其中 \(L=\)`context_len`\(=128\)（详见 14 章对 `context_len` 与 `tokenizer_max_len` 对齐的讨论）。
+
+**第三步：数据加载时取缓存。**
+
+```222:233:src/fastwam/datasets/lerobot/robot_video_dataset.py
+        context, context_mask = self._get_cached_text_context(instruction)
+        # NOTE: to keep consistent with wan2.2's behavior
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+        
+        data = {
+            "video": video,
+            "action": action,
+            "proprio": proprio,
+            "prompt": instruction,
+            "context": context,
+            "context_mask": context_mask,
+```
+
+这里有一个**容易被忽视却很关键的 trick**：
+
+1. `context[~context_mask] = 0.0`：把 padding 位置（T5 真实 token 之外的填充位）的 embedding **显式清零**；
+2. `context_mask = torch.ones_like(context_mask)`：随后把 mask **全部置 1**。
+
+含义是：与其在 cross-attention 里用 mask 屏蔽 padding，Wan2.2 选择**让 padding 位置变成零向量并允许被 attend**。零向量经过 K/V 投影后是一个固定的偏置项，等价于一组「无信息记忆槽」。这与原始实现保持一致（`encode_prompt` 在线路径也做了同样处理，见 15.9）。所以在 FastWAM 里，下游看到的 `context_mask` 实际上恒为全 1——真正起作用的是「padding 已被清零」这一事实。
+
+### 15.3 context 的预处理与可选 proprio 融合（build_inputs）
+
+进入模型后，`build_inputs` 把 context 搬到设备、转 dtype，并把 mask 转成 bool：
+
+```350:351:src/fastwam/models/wan22/fastwam.py
+        context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+```
+
+如果模型启用了本体感觉编码器（`proprio_encoder`），机器人状态会被编码成**一个额外的 context token** 拼到文本序列末尾：
+
+```233:240:src/fastwam/models/wan22/fastwam.py
+        proprio_token = self.proprio_encoder(
+            proprio.to(device=self.device, dtype=context.dtype).unsqueeze(1)
+        ).to(dtype=context.dtype) # [B, 1, D]
+        proprio_mask = torch.ones((context_mask.shape[0], 1), dtype=torch.bool, device=context_mask.device)
+        return (
+            torch.cat([context, proprio_token], dim=1),
+            torch.cat([context_mask, proprio_mask], dim=1),
+        )
+```
+
+这是一个很优雅的设计：**proprioception 不需要新机制，直接复用 cross-attention 的「记忆库」**——它只是文本记忆之外多挂的一条「我现在的关节状态是这样」的记忆。于是 `context` 从 `[B, L, 4096]` 变成 `[B, L+1, ...]`。
+
+```mermaid
+flowchart LR
+  Inst["task instruction"] --> Tmpl["DEFAULT_PROMPT 模板"]
+  Tmpl --> T5["T5 离线编码 (precompute)"]
+  T5 --> Cache["缓存 .t5_len128.pt<br/>context [L,4096] + mask [L]"]
+  Cache --> Get["_get_cached_text_context<br/>padding 清零 + mask 置 1"]
+  Get --> BI["build_inputs<br/>to device / bool"]
+  BI --> Pro{"启用 proprio?"}
+  Pro -->|是| Cat["拼接 proprio token<br/>[B, L+1, D]"]
+  Pro -->|否| Pre["pre_dit"]
+  Cat --> Pre
+```
+
+### 15.4 进入专家前的文本投影（pre_dit）
+
+T5 输出维度是 4096，但 video/action 专家的 hidden dim 不同（video 3072、action 1024）。所以每个专家在 `pre_dit` 里用**自己的一套** `text_embedding`（Linear→GELU→Linear）把文本投影到本专家的隐藏维度。
+
+Video 专家：
+
+```369:373:src/fastwam/models/wan22/wan_video_dit.py
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+```
+
+```558:558:src/fastwam/models/wan22/wan_video_dit.py
+        context = self.text_embedding(context) # (B, L, dim)
+```
+
+Action 专家结构同构（`action_dit.py:75-79` 定义、`action_dit.py:284` 调用），并把 1D 的 `[B, L]` mask 扩展成 cross-attn 需要的 `[B, seq_len, L]`：
+
+```284:285:src/fastwam/models/wan22/action_dit.py
+        context_emb = self.text_embedding(context)
+        context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
+```
+
+**要点**：video 与 action **各自独立**地把同一份 T5 表征投影到自己的空间。这意味着 video co-training 时，文本语义会同时塑造视频分支和动作分支的表征——这是「视频联合训练改善动作表征」的通道之一（呼应第 1 章结论与 14 章冻结策略）。
+
+### 15.5 Cross-Attention 的原理（理论）
+
+**自注意力 vs 交叉注意力。** 注意力的统一公式是：
+
+\[
+\mathrm{Attention}(Q,K,V)=\mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}+M\right)V
+\]
+
+区别只在 \(Q,K,V\) 的来源：
+
+| 类型 | Query 来自 | Key / Value 来自 | 作用 |
+|------|-----------|------------------|------|
+| **Self-Attention** | 序列自身 token | 序列自身 token | token 之间互相通信 |
+| **Cross-Attention** | 序列 A（这里：video/action token） | 序列 B（这里：文本 context） | 把 B 的信息注入 A |
+
+在 FastWAM 的 cross-attention 中：
+
+- \(Q = W_q\,x\)，\(x\) 是 video/action token，长度 \(S\)；
+- \(K = W_k\,c,\ V = W_v\,c\)，\(c\) 是文本 context，长度 \(L\)；
+- 注意力矩阵形状是 \(S\times L\)：**每个 token 对每个文本位置打一个相关性分数**，再用 softmax 归一化后加权求和文本 value。
+
+\(M\) 是掩码项：被屏蔽位置取 \(-\infty\)（softmax 后权重为 0）。如 15.2 所述，FastWAM 把 padding 清零而非屏蔽，故实际 \(M\) 近乎全 0。
+
+**为什么能「桥接」不同长度？** 自注意力要求 Q、K 同源、长度相同；而 cross-attention 的 \(S\) 与 \(L\) 可以完全不同（这里 \(S\)=几千个视频 patch、\(L\)=128 个文本 token），注意力矩阵 \(S\times L\) 天然把两种模态、两种长度对齐起来。
+
+**学术脉络（旁征博引）。** Cross-attention 并非新发明：
+
+- **Vaswani et al., 2017（Transformer）**：机器翻译里 decoder 通过 encoder-decoder attention 读取源语言——这正是 cross-attention 的原型；
+- **Rombach et al., 2022（Latent Diffusion / Stable Diffusion）**：首次把文本通过 cross-attention 注入 U-Net 去噪网络，奠定「文生图」的条件注入范式；
+- **Jaegle et al., 2021（Perceiver IO）**：用 cross-attention 把超长输入压缩到固定 latent，体现其「跨长度桥接」能力。
+
+FastWAM 的视频骨干 Wan2.2 与动作专家都沿用了「DiT + 文本 cross-attention」这一在扩散生成里被反复验证的成熟设计。
+
+### 15.6 Cross-Attention 的实现（代码）
+
+底层模块 `CrossAttention`：Query 来自 token、Key/Value 来自文本 context。
+
+```215:220:src/fastwam/models/wan22/wan_video_dit.py
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(ctx))
+        v = self.v(ctx)
+        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=ctx_mask)
+        return self.o(x)
+```
+
+`flash_attention` 实际落到 PyTorch 的 SDPA，把 `ctx_mask` 作为 `attn_mask`：
+
+```14:21:src/fastwam/models/wan22/wan_video_dit.py
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
+    if compatibility_mode:
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        return x
+```
+
+**block 内的三段式结构。** 每个 `DiTBlock` 是「自注意力 → 交叉注意力 → FFN」三段残差，cross-attn 夹在中间、带独立的 `norm3`：
+
+```263:267:src/fastwam/models/wan22/wan_video_dit.py
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, self_attn_mask=self_attn_mask))
+        x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = self.gate(x, gate_mlp, self.ffn(input_x))
+```
+
+**MoT 路径下的等价实现。** 在 FastWAM 主路径里，self-attn 被 MoT 接管做 video+action 混合注意力，cross-attn 则在 `_apply_expert_post_block` 中按 expert 各自执行：
+
+```110:122:src/fastwam/models/wan22/mot.py
+        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
+
+        if context_payload is not None:
+            context = context_payload.get("context")
+            if context is not None:
+                context_mask = context_payload.get("mask")
+                if context_mask is not None and context_mask.dim() == 3:
+                    context_mask = context_mask.unsqueeze(1)
+                x = x + block.cross_attn(block.norm3(x), context, ctx_mask=context_mask)
+
+        mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
+        x = block.gate(x, gate_mlp, block.ffn(mlp_input))
+```
+
+**一个重要区分**：
+
+```mermaid
+flowchart TB
+  subgraph perlayer ["每层（MoT 内）"]
+    SA["Self-Attention<br/>(video+action 拼接, 混合)"]
+    CAV["video.cross_attn → video 文本"]
+    CAA["action.cross_attn → action 文本"]
+    FFN["各自 FFN"]
+  end
+  SA --> CAV
+  SA --> CAA
+  CAV --> FFN
+  CAA --> FFN
+```
+
+- **Self-attention 是「混合」的**：video 与 action token 拼在一起做 mixed-attention（这正是 MoT 让动作「看到」未来视频的关键，见第 3 章注意力掩码）；
+- **Cross-attention 是「各自」的**：每个 expert 用自己的 `block.cross_attn` 读各自投影后的文本，不跨专家混合。
+
+### 15.7 为什么要用 Cross-Attention（动机）
+
+1. **条件注入优于序列拼接。** 若把文本直接拼进 token 序列做 self-attn，则文本会占用宝贵的序列长度、且与几千个视频 patch 一起算 \(O((S+L)^2)\)。cross-attn 把代价降到 \(O(S\cdot L)\)，且文本长度与 token 长度解耦。
+2. **逐层重复注入，抗稀释。** 文本 K/V 在 30 层里**每层都重新被 attend 一次**，避免「条件只在输入处给一次、深层就忘了」的问题。
+3. **与 AdaLN 分工明确。** 时间步 \(t\) 通过 `t_mod`（AdaLN 调制，见 14.7.5）注入「现在去噪到第几步」；文本语义通过 cross-attn 的 K/V 注入「要做什么任务」。两条通路职责不同、互不干扰。
+4. **机制可复用。** proprio 作为额外 context token 接入（15.3），无需任何新模块，体现 cross-attention「记忆库」抽象的通用性。
+
+### 15.8 训练流程中的 context（co-training 视角）
+
+`training_loss` 在调用 MoT 时，为 video、action 两个专家分别打包各自投影后的 context 进 `context_all`：
+
+```514:523:src/fastwam/models/wan22/fastwam.py
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+```
+
+于是同一条文本指令在每层、对两个专家都施加 cross-attention 影响。结合第 14 章的冻结策略——`cross_attn` 隶属于 `dit`(=`mot`) 因而是**可训练**的——文本条件能力随训练一起被优化。这条「文本→双专家」的共享通路，是 video co-training 提升动作策略表征的机制之一。
+
+### 15.9 推理流程中的 context
+
+**两种互斥入口。** 推理时既可传在线 `prompt`，也可直接传预计算好的 `context/context_mask`，二者不能同时给：
+
+```964:969:src/fastwam/models/wan22/fastwam.py
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+```
+
+走 `prompt` 时调用在线 T5 编码，并复刻了与数据侧一致的「padding 清零 + mask 全 1」处理：
+
+```208:217:src/fastwam/models/wan22/fastwam.py
+        ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
+        ids = ids.to(self.device)
+        mask = mask.to(self.device, dtype=torch.bool)
+        prompt_emb = self.text_encoder(ids, mask)
+        # FIXME: original implementation's zero padding is visible in cross-attn.
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        for i, v in enumerate(seq_lens):
+            prompt_emb[i, v:] = 0
+        mask = torch.ones_like(mask)
+        return prompt_emb.to(device=self.device), mask
+```
+
+**KV cache 与 cross-attn 的关系（关键性能点）。** `infer_action` 的快路径里：
+
+- `prefill_video_cache` 只缓存视频 **self-attention** 的 K/V（视频分支算一次即固定）；
+- 动作迭代去噪时，每步都要重算 action 的 self-attn 以及 **cross-attn**。但由于 `context` 在整个去噪过程中**固定不变**，cross-attn 读的文本是同一份，结果稳定、语义一致；其代价是每步 \(O(S_a\cdot L)\)，因 \(L=128\) 很小而开销可控。
+
+```mermaid
+sequenceDiagram
+  participant Img as 当前观测
+  participant Txt as 文本 context
+  participant V as Video 专家
+  participant A as Action 专家
+  Img->>V: pre_dit + prefill_video_cache
+  V-->>A: 缓存 video self-attn K/V (只算一次)
+  loop 每个去噪步
+    A->>A: action self-attn (+ 读 video KV cache)
+    Txt->>A: cross-attn 读文本 (context 固定)
+    A->>A: flow-matching 更新 action latent
+  end
+```
+
+**文本 CFG（背景）。** `infer_action` / `infer` 的签名暴露了 `negative_prompt` 与 `text_cfg_scale`，对应 classifier-free guidance 的通用形式：
+
+\[
+\hat{\epsilon}=\epsilon_{\varnothing}+s\,(\epsilon_{c}-\epsilon_{\varnothing})
+\]
+
+其中 \(\epsilon_c\) 是条件预测、\(\epsilon_\varnothing\) 是无条件（negative）预测、\(s\) 为引导强度。需注意：在当前 `infer_action` 的动作快路径实现里，去噪循环只用了条件分支 `pred_action_posi`（`fastwam.py:1042`），并未真正混合 negative——参数预留但快路径默认 \(s=1.0\) 等价关闭。完整的双分支 CFG 更多体现在视频联合推理 `infer` 中（`text_cfg_scale` 默认 5.0）。
+
+### 15.10 小结
+
+| 阶段 | context 的形态 / 操作 | 关键位置 |
+|------|----------------------|----------|
+| 数据生成 | instruction → 模板 → T5 离线编码 → 缓存 `[L,4096]` | `precompute_text_embeds.py` |
+| 数据加载 | 取缓存 + padding 清零 + mask 全 1 | `robot_video_dataset.py:222-225` |
+| 预处理 | to device/bool，可选拼 proprio token | `fastwam.py:350,219-240` |
+| 投影 | 各专家 `text_embedding` 投到 hidden，mask 扩成 `[B,S,L]` | `wan_video_dit.py:558`, `action_dit.py:284-285` |
+| 使用 | 每层 self→**cross**→FFN，Q=token、K/V=文本 | `mot.py:110-122`, `wan_video_dit.py:265` |
+| 训练 | video/action 双专家共享文本 cross-attn | `fastwam.py:514-523` |
+| 推理 | prompt 在线编码或缓存；context 固定、逐步 cross-attn | `fastwam.py:964-969`, `infer_action` |
+
+**一句话**：文本条件通过「**离线编码 → 逐专家投影 → 每层 cross-attention**」注入模型；cross-attention 用「token 提问、文本作答」的方式，在不增加序列长度的前提下，把语言语义（以及 proprio 状态）持续、逐层地落到视频像素与机器人动作上——它正是世界动作模型把「指令」翻译成「行为」的那座桥。
+
+---
+
+## 16. Flow Matching 调度器与时间步全解析
+
+> 本章聚焦 `training_loss` 第一行 `timestep_video = self.train_video_scheduler.sample_training_t(...)` 背后的整套机制：`timestep_video`、`latents`、`target_video`、`video_weight` 各自从哪来、怎么用、为什么这么设计，并系统剖析 [`WanContinuousFlowMatchScheduler`](src/fastwam/models/wan22/schedulers/scheduler_continuous.py) 的数学、数据流与调用流；最后对比**训练**与**两种推理**（`infer_action` / `infer_joint`）中这些组件的角色变化。
+
+### 16.1 引子：从「加噪—去噪」到「直线流」
+
+生成式扩散模型有多种数学参数化。早期的 **DDPM**（Ho et al., 2020）用一条弯曲的方差调度把数据逐步推成噪声，模型预测噪声 \(\epsilon\)；而 FastWAM（继承 Wan2.2）采用的是 **Flow Matching**（Lipman et al., 2022；Rectified Flow，Liu et al., 2022）——它把「数据 → 噪声」建模成一条**直线**，模型学习这条直线上的**恒定速度场**。Stable Diffusion 3（Esser et al., 2024）进一步证明：在直线流上配合 shift 时间采样，能显著提升高分辨率生成质量。
+
+可以用一句话概括三者关系：
+
+> DDPM 学「这一步该减多少噪声」，Flow Matching 学「从此刻笔直走向数据该往哪个方向走、走多快」。
+
+FastWAM 的调度器正是这套「连续时间 + 直线插值 + 预测速度」哲学的实现。下面逐一拆解。
+
+### 16.2 timestep_video 怎么来：sample_training_t 与 shift 采样
+
+```python 
+#src/fastwam/models/wan22/schedulers/scheduler_continuous.py:31:37
+    def sample_training_t(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if batch_size <= 0:
+            raise ValueError(f"`batch_size` must be positive, got {batch_size}")
+        u = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        sigma = self._phi(u, self.shift)
+        timestep = sigma * float(self.num_train_timesteps)
+        return timestep.to(dtype=dtype)
+```
+
+每个训练样本独立采一个时间步，流程是 **u → σ → t**：
+
+1. $u \sim \mathrm{Uniform}(0,1)$；
+2. 经 shift 变换得到噪声水平 $\sigma=\phi(u)$；
+3. 乘以 `num_train_timesteps`（=1000）得到「名义时间步」\($t=\sigma\cdot 1000$\)。
+
+shift 变换 `_phi`：
+
+```python 
+#src/fastwam/models/wan22/schedulers/scheduler_continuous.py:17:19:
+    @staticmethod
+    def _phi(u: torch.Tensor, shift: float) -> torch.Tensor:
+        return shift * u / (1.0 + (shift - 1.0) * u)
+```
+
+\[
+$$\phi(u)=\frac{s\,u}{1+(s-1)\,u},\qquad s=\text{shift}$$
+\]
+
+**这个变换在做什么？** 当 \(s=1\) 时 \($\phi(u)=u$\)（均匀采样）；当 \(s>1\)（FastWAM 用 \(s=5\)）时，\($\phi$\) 是一条上凸曲线，把均匀的 \(u\) **整体推向更大的 \($\sigma$\)**，即更偏向高噪声端：
+
+| u | σ=φ(u), s=1 | σ=φ(u), s=5 |
+|---|---|---|
+| 0.1 | 0.10 | 0.36 |
+| 0.3 | 0.30 | 0.68 |
+| 0.5 | 0.50 | 0.83 |
+| 0.7 | 0.70 | 0.92 |
+| 0.9 | 0.90 | 0.98 |
+
+**为什么要偏向高噪声？** 视频/高分辨率 latent 维度极高，高噪声区的去噪更难、对最终质量影响更大；多采样高噪声样本能让模型在「最吃力」的区段得到更多训练。SD3 用 logit-normal 采样、Wan 系列用这种 shift 变换，动机一致。
+
+**为什么用连续 t 而非离散 step？** Flow matching 的速度场是定义在连续区间 \($\sigma\in[0,1]$\) 上的；训练时在连续轴上随机取点，比固定在 1000 个离散格点上更平滑、无量化误差。
+
+### 16.3 latents 怎么来：add_noise 线性插值
+
+```python
+#49:56:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        sigma = (timestep / float(self.num_train_timesteps)).to(
+            original_samples.device, dtype=original_samples.dtype
+        )
+        if sigma.ndim == 0:
+            return (1 - sigma) * original_samples + sigma * noise
+        sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
+        return (1 - sigma) * original_samples + sigma * noise
+```
+
+\[
+$x_\sigma=(1-\sigma)\,x_0+\sigma\,\epsilon,\qquad \sigma=\frac{t}{1000},\ \epsilon\sim\mathcal N(0,I)$
+\]
+
+这就是「直线流」的字面含义：在干净数据 \(x_0\)（VAE latent）与高斯噪声 \($\epsilon$\) 之间做**线性插值**。
+
+- \($\sigma=0$\)：\($x_\sigma=x_0$\)，纯数据；
+- \($\sigma=1$\)：\($x_\sigma=\epsilon$\)，纯噪声；
+- \($\sigma=0.5$\)：数据与噪声各半。
+
+对比 DDPM 的 \($x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$\)（系数非线性、平方和为 1），flow matching 的系数是简单的 \($(1-\sigma,\sigma)$\)，轨迹是直线。
+
+在 `training_loss` 里：
+
+```python
+#458:468:src/fastwam/models/wan22/fastwam.py
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=input_latents.dtype,
+        )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+
+        if inputs["first_frame_latents"] is not None:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
+```
+
+注意最后两行：**首帧 latent 被还原为干净条件帧**（不加噪）。因为 FastWAM 是「给定当前观测、预测未来」，首帧是已知的当前画面，应作为条件而非待去噪目标（呼应第 3、15 章）。
+
+> **注记：这里的「首帧」指什么？**
+>
+> 结论：**一次抽样出来的样本（采样窗口）中的第一帧**，即该样本的「当前观测帧」\(t=0\)。它**不是** episode 起步时的第一帧（除非窗口恰好从 episode 开头开始），也**不是** flow matching 去噪迭代意义上的「第一步」（去噪发生在噪声水平 \(\sigma\) 上，与帧序无关）。
+>
+> **1. 采样窗口以 `idx` 对应帧为 \(t=0\)，向未来展开。** 数据集构造时间偏移时强制 `past_obs_size=0`，偏移为 `range(0, obs_size)`：
+>
+> ```50:51:src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+>         assert past_obs_size == 0
+>         assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
+> ```
+>
+> ```85:87:src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+>             delta_timestamps[meta["lerobot_key"]] = [
+>                 (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+>             ]
+> ```
+>
+> 即 `[0, 1, …, obs_size-1]` 秒（按 fps 缩放）。`__getitem__(idx)` 的 `idx` 可落在 episode 内任意合法位置，故窗口第 0 帧通常是 episode **中间某帧**，而非 episode 第一帧。
+>
+> **2. 视频稀疏采样后，第 0 帧仍是窗口的 \(t=0\) 帧。** `video_sample_indices` 以 0 开头（`range(0, num_frames, action_video_freq_ratio)`），故 `video[..., 0, ...]` 对应采样窗口起始观测。
+>
+> **3. `first_frame_latents` 取 VAE latent 时间维第 0 项。** 在 `build_inputs` 中直接从已编码的 `input_latents` 切片：
+>
+> ```342:344:src/fastwam/models/wan22/fastwam.py
+>         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
+>             first_frame_latents = input_latents[:, :, 0:1]
+>             fuse_flag = True
+> ```
+>
+> **4. 训练时先对整段加噪，再把时间维第 0 帧覆盖回 clean。** 上引 `training_loss` 中 `add_noise` 作用于全部 latent 帧，随后 `latents[:, :, 0:1] = first_frame_latents` 只钉死**帧序维** index 0——与 \(\sigma\) 维度的去噪步无关。
+>
+> **5. 推理侧语义一致：首帧 = 传入的当前观测图。** `infer_action` / `infer_joint` 用单张 `input_image` 编码得到 `first_frame_latents`，并在 `infer_joint` 每步去噪后反复 `latents_video[:, :, 0:1] = first_frame_latents.clone()`（`fastwam.py:888-890`），印证训练里「首帧」就是**当前观测**，不是 episode 起点或去噪第一步。
+>
+> | 候选含义 | 是否正确 |
+> |----------|---------|
+> | episode 起步的第一帧 | 否（窗口起点 `idx` 任意） |
+> | 去噪迭代的第一步 | 否（\(\sigma\) 与帧序是两维） |
+> | **一次样本窗口中的第一帧（当前观测 \(t=0\)）** | **是** |
+
+### 16.4 target_video 怎么来：速度参数化
+
+```python
+#58:61:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    @staticmethod
+    def training_target(sample: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        del timestep
+        return noise - sample
+```
+
+\[
+$v_{\text{target}}=\epsilon-x_0$
+\]
+
+**推导**：对直线轨迹求导，速度恒定，与 \($\sigma$\) 无关：
+
+\[
+$x_\sigma=(1-\sigma)x_0+\sigma\epsilon \;\Longrightarrow\; \frac{\mathrm dx_\sigma}{\mathrm d\sigma}=\epsilon-x_0$
+\]
+
+所以模型要预测的「速度」就是从数据指向噪声的恒定向量 \($\epsilon-x_0$\)（注意 `training_target` 直接 `del timestep`——目标确实不依赖时间）。
+
+**为什么预测速度(或者说`残差`)而非 \($\epsilon$\) 或 \($x_0$\)？** 直线流的速度目标在整条轨迹上**恒定**，回归目标稳定、信噪比均衡，训练比预测 \($\epsilon$\)（在低噪声端尺度爆炸）或预测 \($x_0$\)（在高噪声端难以恢复）都更稳健。这也是 Rectified Flow / SD3 选择 v-/速度参数化的核心理由。
+
+### 16.5 video_weight 怎么来：高斯钟形重加权
+
+```python
+#39:47:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def training_weight(self, timestep: torch.Tensor) -> torch.Tensor:
+        t = timestep.to(dtype=torch.float32)
+        steps = float(self.num_train_timesteps)
+        y = torch.exp(-2.0 * ((t - (steps / 2.0)) / steps) ** 2)
+        y_shifted = y - self._y_min
+        weight = y_shifted / (self._weight_norm_const + self.eps)
+        if weight.numel() == 1:
+            return weight.reshape(())
+        return weight
+```
+
+\[
+y(t)=\exp\!\left(-2\left(\frac{t-T/2}{T}\right)^2\right),\quad
+w(t)=\frac{y(t)-y_{\min}}{Z}
+\]
+
+其中 \(T=1000\)，\(y_{\min}\) 与归一化常数 \(Z\) 在构造时按 shift 后的时间网格预计算：
+
+```21:29:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def _precompute_training_weight_stats(self) -> tuple[float, float]:
+        steps = self.num_train_timesteps
+        u_grid = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)[:-1]
+        t_grid = self._phi(u_grid, self.shift) * float(steps)
+        y_grid = torch.exp(-2.0 * ((t_grid - (steps / 2.0)) / steps) ** 2)
+        y_min = float(y_grid.min().item())
+        y_shifted_grid = y_grid - y_min
+        norm_const = float(y_shifted_grid.mean().item())
+        return y_min, norm_const
+```
+
+**含义**：\(y(t)\) 是一条以 \(t=T/2\)（中等噪声）为峰的高斯钟形曲线。减去 \(y_{\min}\) 让两端权重趋近 0，再除以均值 \(Z\) 使权重整体尺度归一（期望约为 1）。**效果是把学习预算集中在中等噪声区**——那里既不像低噪声那样「几乎无需学习」，也不像极高噪声那样「信息太少」，是信息量最丰富、最该投入算力的区段。
+
+这与扩散训练里的损失重加权思想一脉相承：EDM（Karras et al., 2022）、min-SNR 加权（Hang et al., 2023）、SD3 的 logit-normal 加权都在解决同一个问题——不同噪声水平的损失量级差异巨大，需重加权以平衡。
+
+### 16.6 五者如何合成 video loss（训练数据流）
+
+把上述组件串起来，一个训练步的视频分支是：
+
+```mermaid
+flowchart TB
+  X0["x0 = VAE latent"] --> ADD["add_noise"]
+  EPS["ε ~ N(0,I)"] --> ADD
+  U["u ~ Uniform"] --> PHI["σ = φ(u, shift=5)"]
+  PHI --> ADD
+  ADD --> XS["x_σ = (1-σ)x0 + σε<br/>(首帧还原为 clean)"]
+  EPS --> TGT["v_target = ε - x0"]
+  X0 --> TGT
+  XS --> NET["pre_dit → MoT → post_dit"]
+  PHI --> NET
+  NET --> PRED["pred_video (预测速度)"]
+  PRED --> MSE["per-sample MSE(pred, v_target)<br/>+ padding 掩码"]
+  TGT --> MSE
+  PHI --> W["video_weight = w(t) 高斯钟形"]
+  MSE --> LOSS["loss_video = mean(per_sample · weight)"]
+  W --> LOSS
+```
+
+代码落点：
+
+```539:548:src/fastwam/models/wan22/fastwam.py
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+        )
+        loss_video = (loss_video_per_sample * video_weight).mean()
+```
+
+`_compute_video_loss_per_sample` 内部对 padding 帧做掩码（呼应第 10 章数据 padding），保证补齐帧不污染损失。最终 `loss_video` 与 `loss_action` 加权求和成总损失（第 12 章）。
+
+### 16.7 WanContinuousFlowMatchScheduler 类全景
+
+该类把 flow matching 的训练与推理职责集中在一起，方法可分两组：
+
+| 分组 | 方法 | 作用 |
+|------|------|------|
+| **训练侧** | `sample_training_t` | 采连续时间步 t（shift 偏向高噪声） |
+| | `add_noise` | 线性插值得到 \(x_\sigma\) |
+| | `training_target` | 速度目标 \(\epsilon-x_0\) |
+| | `training_weight` | 高斯钟形损失重加权 |
+| **推理侧** | `build_inference_schedule` | 生成离散去噪时间表 + 步长 Δσ |
+| | `step` | Euler 积分更新 latent |
+| **内部** | `_phi` / `_precompute_training_weight_stats` | shift 变换 / 预计算权重常数 |
+
+类几乎**无状态**（仅缓存两个标量常数），因此可被多个实例安全复用。FastWAM 构造 **4 个实例**：train/infer × video/action，用不同 shift 区分：
+
+```63:78:src/fastwam/models/wan22/fastwam.py
+        self.train_video_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=video_num_train_timesteps,
+            shift=video_train_shift,
+        )
+        self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=video_num_train_timesteps,
+            shift=video_infer_shift,
+        )
+        self.train_action_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=action_num_train_timesteps,
+            shift=action_train_shift,
+        )
+        self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=action_num_train_timesteps,
+            shift=action_infer_shift,
+        )
+```
+
+（配置默认 `train_shift=infer_shift=5.0`，见 `configs/model/fastwam.yaml`；视频与动作分开调度，因为二者的噪声几何不同。）
+
+### 16.8 推理变化（一）：infer_action —— 视频时间步恒为 0
+
+推理的核心区别在于：**不再随机采 t，而是按固定时间表逐步积分**；且 FastWAM 的快路径 `infer_action` **根本不去噪视频**。
+
+```993:996:src/fastwam/models/wan22/fastwam.py
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+```
+
+视频时间步被**钉死为 0**，即 \(\sigma=0\)、视频 latent 被当作干净条件，只前向一次、把每层的 K/V 缓存下来（`prefill_video_cache`，见第 5、14 章），之后不再更新视频。
+
+只有动作分支真正迭代去噪。先用 `build_inference_schedule` 生成时间表：
+
+```63:80:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def build_inference_schedule(
+        self,
+        num_inference_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        shift_override: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ...
+        u_steps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device, dtype=torch.float32)
+        sigma_steps = self._phi(u_steps, shift)
+        timesteps = sigma_steps[:-1] * float(self.num_train_timesteps)
+        deltas = sigma_steps[1:] - sigma_steps[:-1]
+        return timesteps.to(dtype=dtype), deltas.to(dtype=dtype)
+```
+
+`u_steps` 从 1 线性降到 0，经 `_phi` 得到一串从大到小的 \(\sigma\)；`deltas` 是相邻 σ 之差（**为负**，因为 σ 递减）。再用 `step` 做欧拉积分：
+
+```82:88:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    @staticmethod
+    def step(model_output: torch.Tensor, delta: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
+        delta = delta.to(sample.device, dtype=sample.dtype)
+        if delta.ndim == 0:
+            return sample + model_output * delta
+        delta = delta.view(-1, *([1] * (sample.ndim - 1)))
+        return sample + model_output * delta
+```
+
+\[
+x_{\sigma+\Delta\sigma}=x_\sigma+v_\theta\cdot\Delta\sigma
+\]
+
+由于 \(\Delta\sigma<0\) 且 \(v_\theta\approx\epsilon-x_0\)，每步把 latent 沿「指向数据」的反方向移动一点，\(\sigma\) 从接近 1（纯噪声）逐步走到 0（动作）。动作去噪循环：
+
+```1030:1044:src/fastwam/models/wan22/fastwam.py
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+
+            pred_action_posi = self._predict_action_noise_with_cache(
+                latents_action=latents_action,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+            )
+            pred_action = pred_action_posi
+
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+```
+
+**这正是「Fast」的来源**（呼应第 5 章）：视频不参与去噪迭代，省掉了最贵的 30 层视频 DiT 的多步重算。
+
+### 16.9 推理变化（二）：infer_joint —— 视频也迭代去噪
+
+`infer_joint` 是「imagine-then-execute」式的完整路径：video 和 action **都**用各自的 infer scheduler 迭代去噪。
+
+```854:890:src/fastwam/models/wan22/fastwam.py
+        infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_video.dtype,
+            shift_override=sigma_shift,
+        )
+        ...
+        for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
+            infer_timesteps_video,
+            infer_deltas_video,
+            infer_timesteps_action,
+            infer_deltas_action,
+        ):
+            ...
+            latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            latents_video[:, :, 0:1] = first_frame_latents.clone()
+```
+
+关键差异：
+
+- 视频从纯噪声出发，逐步去噪成未来视频帧；
+- 每步去噪后 `latents_video[:,:,0:1]=first_frame`：**首帧始终被钉死为条件帧**，与训练时 `latents[:,:,0:1]=first_frame_latents` 一致；
+- `sigma_shift` 可覆盖默认 infer_shift；`num_inference_steps` 默认 20。
+
+FastWAM 还内置了等价性自检：当 `test_action_with_infer_action=True` 时，会比较 `infer_joint` 与 `infer_action` 产出的动作是否一致，验证「去不去噪视频」对动作影响极小（这正是论文核心结论的工程化体现）：
+
+```893:898:src/fastwam/models/wan22/fastwam.py
+        if test_action_with_infer_action:
+            if not torch.allclose(action_out, action_only_out, atol=1e-2, rtol=1e-2):
+                max_abs_diff = (action_out - action_only_out).abs().max().item()
+                logger.warning(
+                    f"Action from infer_joint and infer_action differ with max abs diff {max_abs_diff:.6f}. "
+                )
+```
+
+两条推理路径的时序对比：
+
+```mermaid
+flowchart LR
+  subgraph IA ["infer_action (Fast)"]
+    IAV["video: σ=0, 前向 1 次<br/>prefill KV cache"]
+    IAA["action: N 步去噪<br/>(读 video KV)"]
+    IAV --> IAA
+  end
+  subgraph IJ ["infer_joint (完整)"]
+    IJV["video: N 步去噪<br/>每步钉死首帧"]
+    IJA["action: N 步去噪"]
+    IJV -.每步联合.- IJA
+  end
+```
+
+### 16.10 训练 vs 推理对照小结
+
+| 维度 | 训练 (training_loss) | 推理 infer_action | 推理 infer_joint |
+|------|----------------------|-------------------|------------------|
+| 时间步来源 | `sample_training_t` 随机连续 σ | video=0；action 按 schedule | video/action 均按 schedule |
+| 视频处理 | `add_noise` 加噪后预测速度 | 不去噪（σ=0 条件） | 逐步去噪，首帧钉死 |
+| 动作处理 | `add_noise` 加噪后预测速度 | N 步 Euler 去噪 | N 步 Euler 去噪 |
+| 网络目标 | 回归速度 \(\epsilon-x_0\) | 预测速度供积分 | 预测速度供积分 |
+| 用到的方法 | sample_training_t / add_noise / training_target / training_weight | build_inference_schedule / step | build_inference_schedule / step |
+| 调度器实例 | train_video / train_action | infer_video(仅 KV) / infer_action | infer_video / infer_action |
+| shift | train_shift=5 | infer_shift=5（可被 sigma_shift 覆盖） | 同左 |
+| video_weight | 参与 loss 重加权 | 不涉及 | 不涉及 |
+
+**一句话**：训练阶段在连续 σ 轴上随机取点、用线性加噪构造样本、回归恒定速度场 \(\epsilon-x_0\)，并用高斯钟形权重把算力压在中等噪声区；推理阶段则沿这条学好的速度场用欧拉法离散积分——而 FastWAM 的「快」在于默认让视频停在 \(\sigma=0\) 当条件、只对动作积分，把世界模型从「先想象再执行」变成「看一眼就动手」。
+
+---
+
+### 16.11 动作分支对照：timestep_action / noisy_action / target_action / action_weight
+
+> 16.2–16.6 已系统讲解 **video 分支** 的 flow matching；本节以相同框架对照 **action 分支**。二者共用 [`WanContinuousFlowMatchScheduler`](src/fastwam/models/wan22/schedulers/scheduler_continuous.py) 的同一套数学（见 16.2/16.4/16.5），但数据对象、特殊条件、loss 掩码与推理角色有显著差异。
+
+#### 16.11.1 与 video 分支的对照总览
+
+| 维度 | Video 分支（16.2–16.6） | Action 分支（本节） |
+|------|------------------------|---------------------|
+| 调度器实例 | `train_video_scheduler` / `infer_video_scheduler` | `train_action_scheduler` / `infer_action_scheduler` |
+| 干净数据 \(x_0\) | VAE latent `[B,48,F,H,W]` | 归一化 action chunk `[B,T,D_a]` |
+| 时间步采样 | `sample_training_t` → `timestep_video` | 同方法 → `timestep_action`（**独立**再采一次） |
+| 加噪结果 | `latents` | `noisy_action` |
+| 训练目标 | `target_video = ε - x_0` | `target_action = ε - a_0` |
+| 损失权重 | `video_weight(w(t_v))` | `action_weight(w(t_a))` |
+| 特殊条件 | 首帧 latent 还原为 clean（16.3） | **无**首步钉死 |
+| Loss 掩码 | `image_is_pad` + 时空对齐 | `action_is_pad` 逐 token |
+| 推理主角 | `infer_action` 中 σ=0，不迭代 | **N 步 Euler 去噪**（部署核心输出） |
+
+四个调度器实例在构造时一并创建（`fastwam.py:63-78`），video/action、train/infer 各一套，默认 `shift=5.0` 相同但**彼此独立**。
+
+#### 16.11.2 timestep_action 怎么来
+
+```470:477:src/fastwam/models/wan22/fastwam.py
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+```
+
+与 16.2 完全相同的采样链：\(u\sim\mathrm{Uniform}(0,1)\to\sigma=\phi(u,s)\to t_a=\sigma\cdot 1000\)，只是调用对象是 **`train_action_scheduler`** 而非 `train_video_scheduler`。
+
+**关键差异：与 `timestep_video` 独立采样。** 同一 batch、同一样本里，video 与 action 各抽一个 \(\sigma\)，互不影响。MoT 混合 attention 时，video token 可能在 \(\sigma_v=0.9\)（很噪）下计算，而 action token 在 \(\sigma_a=0.3\)（较干净）下计算——这符合 co-training 的物理直觉：视频 future latent 与动作 chunk 是不同模态，不必强制「噪声水平同步」。
+
+举例：batch 中第 3 个样本可能得到 `timestep_video=920`（\(\sigma_v\approx0.92\)）而 `timestep_action=310`（\(\sigma_a\approx0.31\)），模型要学会在各种 (σ_v, σ_a) 组合下同时预测两路速度。
+
+#### 16.11.3 noisy_action 怎么来
+
+\[
+a_\sigma=(1-\sigma_a)\,a_0+\sigma_a\,\epsilon,\qquad a_0=\text{sample["action"]},\ \epsilon\sim\mathcal N(0,I)
+\]
+
+- \(a_0\)：LeRobot 原始 action 经 processor 归一化（z-score 等）后的 **ground-truth action chunk**，形状 `[B, T, D_a]`（LIBERO \(D_a=7\)，RobotWin \(D_a=14\)）。
+- **没有** video 分支那种「首帧还原为 clean」的特殊处理——action chunk 里每一步都可能带噪，整段一起学去噪。
+- `noisy_action` 进入 ActionDiT 的输入端，**不是** clean action：
+
+```488:492:src/fastwam/models/wan22/fastwam.py
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+```
+
+`pre_dit` 内部再经 `action_encoder: Linear(D_a → hidden)` 投到 ActionDiT 隐藏维（见 14.7.3）。网络看到的是「当前噪声水平 \(\sigma_a\) 下的动作 latent」，与 video 侧「当前 \(\sigma_v\) 下的 video latent」对称。
+
+#### 16.11.4 target_action 怎么来
+
+```477:477:src/fastwam/models/wan22/fastwam.py
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+```
+
+即 \(v_{\text{target}}=\epsilon-a_0\)（与 16.4 的 \(\epsilon-x_0\) 同形，**与 \(\sigma_a\) 无关**）。模型经 MoT 后输出 `pred_action`，与 target 做逐 token MSE：
+
+```550:550:src/fastwam/models/wan22/fastwam.py
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+```
+
+在机器人策略文献中，对 **action chunk** 做 flow matching / diffusion 生成已是常见范式（Diffusion Policy, Chi et al., 2023；\(\pi_0\), Black et al., 2024 用 flow matching 迭代出连续动作序列）。FastWAM 把同一思想嵌入 MoT 的 action expert，与 video co-training 共享 backbone。
+
+#### 16.11.5 action_weight 怎么来
+
+```558:561:src/fastwam/models/wan22/fastwam.py
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+```
+
+公式与 16.5 的 `video_weight` 相同（高斯钟形 \(w(t)\)），但自变量是 **`timestep_action` 自己的 \(\sigma_a\)**，不是 video 的 \(\sigma_v\)。因此同一训练步里，video loss 与 action loss 可能被不同强度重加权——例如 action 在中等噪声区权重高、video 在高噪声区权重低，两者学习预算独立调节。
+
+#### 16.11.6 action loss 合成与 padding 掩码
+
+Action 分支的 padding 处理与 video 不同：直接用 `action_is_pad` 掩掉无效时间步：
+
+```551:556:src/fastwam/models/wan22/fastwam.py
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+```
+
+Video 侧则需 `_compute_video_loss_per_sample` 把 `image_is_pad` 对齐到 latent 时间维（16.6）。Action 是 1D 时序，掩码更直接。
+
+总损失仍由 \(\lambda\) 加权（默认均为 1.0，见 `configs/model/fastwam.yaml`）：
+
+```563:563:src/fastwam/models/wan22/fastwam.py
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+```
+
+Action 训练数据流：
+
+```mermaid
+flowchart TB
+  A0["a0 = 归一化 action chunk"] --> ADD["add_noise (σ_a)"]
+  EPS["ε ~ N(0,I)"] --> ADD
+  TA["timestep_action = sample_training_t"] --> ADD
+  ADD --> NOISY["noisy_action"]
+  TA --> PRE["action_expert.pre_dit"]
+  NOISY --> PRE
+  PRE --> MOT["MoT mixed-attn"]
+  MOT --> POST["post_dit → pred_action"]
+  EPS --> TGT["target = ε - a0"]
+  A0 --> TGT
+  POST --> MSE["token MSE + action_is_pad"]
+  TGT --> MSE
+  TA --> W["action_weight = w(t_a)"]
+  MSE --> LOSS["loss_action = mean(per_sample · weight)"]
+  W --> LOSS
+```
+
+#### 16.11.7 t_mod 形态差异（action vs video）
+
+同一 `timestep_action` 进入 `pre_dit` 后，action 的 `t_mod` 形状为 **`[B, 6, D_a]`**（整段 chunk 共享一组 AdaLN 调制），而 video 的 `t_mod` 为 **`[B, S_v, 6, D_v]`**（每个 patch token 可有不同调制，且首帧 \(t=0\)，见 14.7.5、16.3）。
+
+含义：action chunk 里 \(T\) 个时间步在扩散意义上处于**同一噪声水平 \(\sigma_a\)**——「这一整块未来动作有多噪」是统一的；video 则允许首帧 clean、其余帧带噪的细粒度时间结构。这是 TI2V「首帧条件 + 未来帧生成」与 action chunk 生成任务的自然差异。
+
+#### 16.11.8 推理：action 是迭代去噪的主角
+
+与 16.8 相对：**video 在 `infer_action` 里 σ=0、只算一次**；**action 才是多步积分的对象**。
+
+1. **初始化**：从标准高斯采样 action latent（不是数据集里的 \(a_0\)）：
+
+```953:958:src/fastwam/models/wan22/fastwam.py
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+```
+
+2. **时间表**：`infer_action_scheduler.build_inference_schedule`（与 16.8 相同，\(\sigma\) 从 1→0，步长 \(\Delta\sigma<0\)）。
+
+3. **每步**：`_predict_action_noise_with_cache` 预测速度 → `infer_action_scheduler.step` 更新 `latents_action`（L1030-1044）。Video KV 已缓存，action 每步读文本 cross-attn + 缓存 video self-attn K/V。
+
+```mermaid
+sequenceDiagram
+  participant Init as 初始化
+  participant Vid as Video 分支
+  participant Act as Action 分支
+  participant Sch as infer_action_scheduler
+
+  Init->>Act: latents_action ~ N(0,I)
+  Vid->>Vid: σ_v=0, prefill KV (一次)
+  Sch->>Act: build_inference_schedule (N 步)
+  loop 每步 k=1..N
+    Act->>Act: pre_dit(latents_action, t_k)
+    Act->>Vid: 读 video KV cache
+    Act->>Act: MoT forward_action_with_video_cache
+    Act->>Act: post_dit → pred velocity
+    Sch->>Act: step: latents += pred · Δσ_k
+  end
+  Act->>Act: 输出 action chunk
+```
+
+在 **`infer_joint`**（16.9）中，action 侧流程与上相同（同样 N 步、同样 `infer_action_scheduler`），只是 video 也并行 N 步去噪；论文与代码验证表明 action 输出与 `infer_action` 几乎一致，说明 **video 去噪迭代对动作预测影响极小**，action 分支的推理逻辑可独立理解。
+
+#### 16.11.9 video vs action 分支对照表（训练 + 推理）
+
+| 维度 | Video | Action |
+|------|-------|--------|
+| \(x_0\) 来源 | VAE.encode(video) | 归一化 `sample["action"]` |
+| 训练加噪对象 | `latents` | `noisy_action` |
+| 时间步 | `timestep_video`（独立采） | `timestep_action`（独立采） |
+| 特殊条件 | 首帧 latent = clean | 无 |
+| 网络输入 | `pre_dit(x=latents, t=t_v)` | `pre_dit(action_tokens=noisy_action, t=t_a)` |
+| 目标 | `target_video = ε - x_0` | `target_action = ε - a_0` |
+| 损失权重 | `video_weight(t_v)` | `action_weight(t_a)` |
+| Padding 掩码 | `image_is_pad` → latent 对齐 | `action_is_pad` 直接 |
+| `t_mod` 形状 | `[B,S_v,6,D_v]` per-token | `[B,6,D_a]` batch 级 |
+| infer_action | σ=0，不迭代 | **N 步** Euler 去噪 |
+| infer_joint | N 步去噪 + 首帧钉死 | N 步去噪（与 infer_action 同） |
+| 调度器（训） | `train_video_scheduler` | `train_action_scheduler` |
+| 调度器（推） | `infer_video_scheduler` | `infer_action_scheduler` |
+
+#### 16.11.10 一句话小结
+
+**Action 分支与 video 分支共用同一 Flow Matching 调度器数学，但用独立的 `train_action_scheduler` 采 \(\sigma_a\)、对归一化 action chunk 线性加噪得到 `noisy_action`、回归恒定速度 \(\epsilon-a_0\)，并用 `action_weight` 按 action 自己的噪声水平重加权；推理时 action 才是多步积分的核心输出，而 video 在快路径里仅作 σ=0 的一次性条件——这正是 FastWAM 把「世界模型」压缩成「高效策略头」在 action 侧的完整体现。**
+
+---
+
+## 17. FastWAM 的 Video/Action Flow Matching 全链路
+
+> 本章把第 16 章的 scheduler 细节提升到「整机工作流」层面：FastWAM 如何同时对 **video latent** 与 **action chunk** 做 flow matching？数据从 batch 到 scheduler、到两个专家的 `pre_dit`、到 MoT 混合注意力、再到 `post_dit` 与 loss，真实调用链是什么？训练时双流联合，推理时为何又能只保留 action 去噪？下面按代码链路完整展开。
+
+### 17.1 总览：FastWAM 不是只做动作扩散，而是 video/action 双流 Flow Matching
+
+许多机器人 diffusion policy 只在动作空间做生成：给定图像和语言，直接把动作 chunk 从噪声迭代成可执行轨迹。FastWAM 的训练更激进：它同时训练两条连续流。
+
+| 分支 | 干净数据 \(x_0\) | 加噪变量 | 学习目标 | 训练意义 |
+|------|------------------|----------|----------|----------|
+| Video | VAE 编码后的未来视频 latent \(z_0\) | `latents` | \($\epsilon_v-z_0$\) | 让模型学习「世界如何变化」 |
+| Action | 归一化动作 chunk \(a_0\) | `noisy_action` | \($\epsilon_a-a_0$\) | 让模型学习「应该如何行动」 |
+
+两条流在训练时通过 MoT 的 mixed attention 共同优化；推理快路径则只保留 action 的反向积分，把 video 分支降为一次性当前观测编码。这就是 FastWAM 论文题目里「Do WAMs Need Test-time Future Imagination?」的工程答案：**训练需要世界建模，部署不一定需要未来视频去噪。**
+
+### 17.2 Flow Matching 的共同数学骨架
+
+Video 和 action 虽然数据形态不同，但共用同一个调度器类 `WanContinuousFlowMatchScheduler`：
+
+```python
+#31:61:src/fastwam/models/wan22/schedulers/scheduler_continuous.py
+    def sample_training_t(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if batch_size <= 0:
+            raise ValueError(f"`batch_size` must be positive, got {batch_size}")
+        u = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        sigma = self._phi(u, self.shift)
+        timestep = sigma * float(self.num_train_timesteps)
+        return timestep.to(dtype=dtype)
+
+    def training_weight(self, timestep: torch.Tensor) -> torch.Tensor:
+        t = timestep.to(dtype=torch.float32)
+        steps = float(self.num_train_timesteps)
+        y = torch.exp(-2.0 * ((t - (steps / 2.0)) / steps) ** 2)
+        y_shifted = y - self._y_min
+        weight = y_shifted / (self._weight_norm_const + self.eps)
+        if weight.numel() == 1:
+            return weight.reshape(())
+        return weight
+
+    def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        sigma = (timestep / float(self.num_train_timesteps)).to(
+            original_samples.device, dtype=original_samples.dtype
+        )
+        if sigma.ndim == 0:
+            return (1 - sigma) * original_samples + sigma * noise
+        sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
+        return (1 - sigma) * original_samples + sigma * noise
+
+    @staticmethod
+    def training_target(sample: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        del timestep
+        return noise - sample
+```
+
+共同数学骨架是：
+
+\[$
+\sigma=\phi(u,s)=\frac{s\,u}{1+(s-1)u},\qquad u\sim \mathrm{Uniform}(0,1)
+$\]
+
+\[$
+x_\sigma=(1-\sigma)x_0+\sigma\epsilon,\qquad \epsilon\sim\mathcal N(0,I)
+$\]
+
+\[$
+v^*(x_\sigma,\sigma)=\frac{\mathrm d x_\sigma}{\mathrm d\sigma}=\epsilon-x_0
+$\]
+
+推理时，调度器把 \($\sigma$\) 从 1 离散走到 0，用一阶 Euler 积分：
+
+\[$
+x_{\sigma+\Delta\sigma}=x_\sigma+v_\theta(x_\sigma,\sigma)\Delta\sigma
+$\]
+
+这与 DDPM 的「预测噪声并按方差表一步步反推」不同；FastWAM 学的是直线流上的速度场。纵向看，它位于 DDPM、Diffusion Policy 之后，更接近 Rectified Flow / Flow Matching / SD3 的连续流生成范式。
+
+### 17.3 训练入口：`training_loss(sample)` 的整体调用流
+
+训练的完整主链路集中在 `FastWAM.training_loss`：
+
+```python
+#448:568:src/fastwam/models/wan22/fastwam.py
+    def training_loss(self, sample, tiled: bool = False):
+        inputs = self.build_inputs(sample, tiled=tiled)
+        input_latents = inputs["input_latents"] #@#???
+        batch_size = input_latents.shape[0]
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        image_is_pad = inputs["image_is_pad"]
+
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=input_latents.dtype,
+        )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+
+        if inputs["first_frame_latents"] is not None:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        ...
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+        }
+        return loss_total, loss_dict
+```
+
+训练数据流可以概括为：
+
+```mermaid
+flowchart TB
+  Sample["batch sample"] --> Build["build_inputs"]
+  Build --> V0["video → VAE latent z0"]
+  Build --> A0["action chunk a0"]
+  Build --> Ctx["context / mask / proprio"]
+
+  V0 --> VN["noise_video"]
+  V0 --> VT["timestep_video"]
+  VN --> VAdd["add_noise → latents"]
+  VT --> VAdd
+  VAdd --> VPre["video_expert.pre_dit"]
+
+  A0 --> AN["noise_action"]
+  A0 --> AT["timestep_action"]
+  AN --> AAdd["add_noise → noisy_action"]
+  AT --> AAdd
+  AAdd --> APre["action_expert.pre_dit"]
+
+  Ctx --> VPre
+  Ctx --> APre
+  VPre --> MoT["MoT.forward mixed attention"]
+  APre --> MoT
+  MoT --> VPost["video post_dit → pred_video"]
+  MoT --> APost["action post_dit → pred_action"]
+  VPost --> VLoss["video weighted MSE"]
+  APost --> ALoss["action weighted MSE"]
+  VLoss --> Total["loss_total"]
+  ALoss --> Total
+```
+
+### 17.4 数据准备：`build_inputs` 如何把 batch 拆成 video/action/context
+
+`training_loss` 的第一步是 `build_inputs(sample)`。它把 dataset batch 拆成四类训练条件：
+
+```python
+#277:383:src/fastwam/models/wan22/fastwam.py
+    def build_inputs(self, sample, tiled: bool = False):
+        video = sample["video"]
+        if "context" not in sample or "context_mask" not in sample:
+            raise ValueError(
+                "FastWAM training requires `sample['context']` and `sample['context_mask']`."
+            )
+        context = sample["context"]
+        context_mask = sample["context_mask"]
+        proprio = sample.get("proprio", None)
+        ...
+        action = sample["action"]
+        ...
+        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        input_latents = self._encode_video_latents(input_video, tiled=tiled)
+
+        first_frame_latents = None
+        fuse_flag = False
+        if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
+            first_frame_latents = input_latents[:, :, 0:1]
+            fuse_flag = True
+        ...
+        action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        ...
+        return {
+            "context": context,
+            "context_mask": context_mask,
+            "input_latents": input_latents,
+            "first_frame_latents": first_frame_latents,
+            "fuse_vae_embedding_in_latents": fuse_flag,
+            "action": action,
+            "action_is_pad": action_is_pad,
+            "image_is_pad": image_is_pad,
+        }
+```
+
+要点：
+
+- `video` 被 VAE 编码为 `input_latents`，这是 video flow matching 的 \(z_0\)；
+- `action` 是 processor 归一化后的动作 chunk，这是 action flow matching 的 \(a_0\)；
+- `context/context_mask` 是文本条件，见第 15 章；
+- `first_frame_latents = input_latents[:, :, 0:1]` 是采样窗口的当前观测帧，见 16.3 注记。
+
+也就是说，FastWAM 的 flow matching 不是直接在 RGB 像素上做，而是在 **VAE latent 空间**与**归一化动作空间**里做。
+
+### 17.5 Video Flow Matching 分支
+
+Video 分支的训练对象是未来视频 latent 的速度场。代码分三段：加噪、前向、损失。
+
+**1. 加噪与目标。**
+
+```python
+#458:468:src/fastwam/models/wan22/fastwam.py
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=input_latents.dtype,
+        )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+
+        if inputs["first_frame_latents"] is not None:
+            latents[:, :, 0:1] = inputs["first_frame_latents"] #@# Shape oof latents is [Bsz, 3, Time, Hig, Wid]
+```
+
+数学上：
+
+\[$
+z_\sigma=(1-\sigma_v)z_0+\sigma_v\epsilon_v,\qquad
+v_v^*=\epsilon_v-z_0
+$\]
+
+其中首帧 latent 被覆盖回 clean，表示当前观测是条件，不是预测对象。
+
+**2. 进入 video expert。**
+
+```python
+#479:486:src/fastwam/models/wan22/fastwam.py
+        video_pre = self.video_expert.pre_dit(
+            x=latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+        )
+```
+
+`pre_dit` 会把 noisy latent patchify 成 token、构造 3D RoPE、构造 per-token `t_mod`，并把文本 context 投影到 video hidden dim。
+
+**3. 输出与损失。**
+
+```python
+#530:548:src/fastwam/models/wan22/fastwam.py
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        ...
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+        )
+        loss_video = (loss_video_per_sample * video_weight).mean()
+```
+
+`pred_video` 是模型预测的 video 速度，监督目标是 `target_video`。`video_weight` 按噪声水平重加权，`image_is_pad` 避免 padding 帧污染损失。
+
+### 17.6 Action Flow Matching 分支
+
+Action 分支完全平行，但对象换成动作 chunk。
+
+```470:477:src/fastwam/models/wan22/fastwam.py
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+```
+
+数学上：
+
+\[
+a_\sigma=(1-\sigma_a)a_0+\sigma_a\epsilon_a,\qquad
+v_a^*=\epsilon_a-a_0
+\]
+
+与 video 侧相比，action 侧有三个关键差异：
+
+1. `timestep_action` 与 `timestep_video` **独立采样**；
+2. action chunk 没有「首帧 clean」这种钉死条件；
+3. 整段 action chunk 共享同一个扩散时间 \(\sigma_a\)。
+
+进入 action expert：
+
+```488:493:src/fastwam/models/wan22/fastwam.py
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+```
+
+输出与损失：
+
+```550:561:src/fastwam/models/wan22/fastwam.py
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+```
+
+这与 Diffusion Policy、\(\pi_0\) 等 action chunk 生成方法在精神上相同：不是一次性回归动作，而是从噪声中通过连续流生成动作序列。
+
+### 17.7 `pre_dit`：两个分支如何把加噪样本变成 Transformer token
+
+Video expert 的 `pre_dit`：
+
+```537:620:src/fastwam/models/wan22/wan_video_dit.py
+        if self.seperated_timestep and fuse_vae_embedding_in_latents:
+            ...
+            token_timesteps = torch.ones(
+                (batch_size, x.shape[2], tokens_per_frame),
+                dtype=timestep.dtype,
+                device=timestep.device,
+            ) * timestep.view(batch_size, 1, 1)
+            token_timesteps[:, 0, :] = 0
+            ...
+            t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
+        ...
+        x = self.patchify(x, control_camera_latents_input=control_camera_latents_input)
+        f, h, w = x.shape[2:]
+        ...
+        x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
+        ...
+        return {
+            "tokens": x_tokens,
+            "freqs": freqs,
+            "t": t,
+            "t_mod": t_mod,
+            "context": context,
+            "context_mask": context_mask,
+            "meta": {
+                "grid_size": (f, h, w),
+                "tokens_per_frame": tokens_per_frame,
+                "batch_size": batch_size,
+            },
+        }
+```
+
+Action expert 的 `pre_dit`：
+
+```274:299:src/fastwam/models/wan22/action_dit.py
+        seq_len = action_tokens.shape[1]
+        if seq_len > self.freqs.shape[0]:
+            raise ValueError(
+                f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
+            )
+
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
+        t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
+
+        tokens = self.action_encoder(action_tokens)
+        context_emb = self.text_embedding(context)
+        context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
+        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+
+        return {
+            "tokens": tokens,
+            "freqs": freqs,
+            "t": t,
+            "t_mod": t_mod,
+            "context": context_emb,
+            "context_mask": context_attn_mask,
+            "meta": {
+                "batch_size": batch_size,
+                "seq_len": seq_len,
+            },
+        }
+```
+
+| 项目 | Video `pre_dit` | Action `pre_dit` |
+|------|-----------------|------------------|
+| 输入 | noisy VAE latent `[B,C,F,H,W]` | noisy action `[B,T,D_a]` |
+| Token 化 | 3D patchify + flatten | `Linear(action_dim → hidden)` |
+| 位置编码 | 3D RoPE `(F,H,W)` | 1D RoPE `T` |
+| 时间调制 | per-token `[B,S_v,6,D_v]`，首帧 t=0 | batch 级 `[B,6,D_a]` |
+| 文本条件 | video hidden dim 投影 | action hidden dim 投影 |
+
+### 17.8 MoT：双流速度场如何在 30 层里互相通信
+
+`pre_dit` 的输出被打包给 MoT：
+
+```504:528:src/fastwam/models/wan22/fastwam.py
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_tokens,
+            },
+            attention_mask=attention_mask,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
+        )
+```
+
+MoT 在每层读取两个 expert 的 block，分别构造 Q/K/V，然后拼接做 mixed attention：
+
+```479:530:src/fastwam/models/wan22/mot.py
+            for name in self.expert_order:
+                expert = self.mixtures[name]
+                block = expert.blocks[layer_idx]
+                x = tokens_all[name]
+                freqs = freqs_all[name]
+                t_mod = t_mod_all[name]
+                ...
+                q_chunks.append(q)
+                k_chunks.append(k)
+                v_chunks.append(v)
+                seq_lens.append(x.shape[1])
+                cached[name] = {
+                    "block": block,
+                    "residual_x": residual_x,
+                    "gate_msa": gate_msa,
+                    "shift_mlp": shift_mlp,
+                    "scale_mlp": scale_mlp,
+                    "gate_mlp": gate_mlp,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                }
+
+            # 3. concat all tokens for mixed attention
+            q_cat = torch.cat(q_chunks, dim=1)
+            k_cat = torch.cat(k_chunks, dim=1)
+            v_cat = torch.cat(v_chunks, dim=1)
+            ...
+            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+```
+
+再把 mixed attention 输出按序列长度拆回 video/action：
+
+```532:556:src/fastwam/models/wan22/mot.py
+            start = 0
+            for name, seq_len in zip(self.expert_order, seq_lens):
+                # 4. split mixed attention output and apply post-attention blocks for each expert
+                end = start + seq_len
+                mixed_slice = mixed[:, start:end, :]
+                cached_expert = cached[name]
+                block = cached_expert["block"]
+                context_payload = context_all.get(name)
+                ...
+                tokens_all[name] = updated_tokens
+                start = end
+
+        return tokens_all
+```
+
+这就是 FastWAM 训练期 video co-training 的核心机制：**video 速度场与 action 速度场不是两个孤立网络，而是在 30 层 MoT 中通过 mixed attention 反复交换信息**。
+
+```mermaid
+sequenceDiagram
+  participant FW as FastWAM.training_loss
+  participant VS as VideoScheduler
+  participant AS as ActionScheduler
+  participant VE as VideoExpert
+  participant AE as ActionExpert
+  participant MT as MoT
+  participant Loss as WeightedMSE
+
+  FW->>VS: sample t_v, add_noise z0
+  FW->>AS: sample t_a, add_noise a0
+  FW->>VE: pre_dit(latents, t_v)
+  FW->>AE: pre_dit(noisy_action, t_a)
+  FW->>MT: tokens/freqs/t_mod/context for both streams
+  MT-->>FW: tokens_out video/action
+  FW->>VE: post_dit(video tokens)
+  FW->>AE: post_dit(action tokens)
+  FW->>Loss: MSE to velocity targets + weights
+```
+
+### 17.9 损失函数：两个速度回归目标如何合成总损失
+
+最终损失是两个速度回归目标的加权和：
+
+\[
+\mathcal L_v
+=\mathbb E\left[
+w(t_v)\,
+\left\|v_\theta^v(z_{\sigma_v}, a_{\sigma_a}, c)-(\epsilon_v-z_0)\right\|^2
+\right]
+\]
+
+\[
+\mathcal L_a
+=\mathbb E\left[
+w(t_a)\,
+\left\|v_\theta^a(z_{\sigma_v}, a_{\sigma_a}, c)-(\epsilon_a-a_0)\right\|^2
+\right]
+\]
+
+\[
+\mathcal L=\lambda_v\mathcal L_v+\lambda_a\mathcal L_a
+\]
+
+代码对应：
+
+```539:568:src/fastwam/models/wan22/fastwam.py
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+        )
+        loss_video = (loss_video_per_sample * video_weight).mean()
+
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+        }
+        return loss_total, loss_dict
+```
+
+注意两种 mask 的语义不同：
+
+- `image_is_pad` 要映射到 VAE latent 时间维，因为视频帧经 temporal downsample；
+- `action_is_pad` 直接对应动作 chunk 的每个时间步；
+- `video_weight` 与 `action_weight` 各自使用自己的 timestep，因此两个分支可以在不同噪声水平上独立重加权。
+
+### 17.10 推理路径一：`infer_action` 只对 action 做反向积分
+
+部署快路径 `infer_action` 是 FastWAM 的核心工程设计：视频只做当前观测编码，动作从噪声迭代生成。
+
+```953:1048:src/fastwam/models/wan22/fastwam.py
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        ...
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        ...
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        ...
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+        ...
+        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            ...
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+
+        return {
+            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
+```
+
+每一步动作速度预测由 `_predict_action_noise_with_cache` 完成：
+
+```695:723:src/fastwam/models/wan22/fastwam.py
+    def _predict_action_noise_with_cache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+```
+
+因此 `infer_action` 的 flow matching 反向积分只有 action 分支参与：
+
+```mermaid
+flowchart TB
+  Img["input_image"] --> VAE["encode first_frame_latents"]
+  VAE --> VPre["video pre_dit, timestep_video=0"]
+  VPre --> Cache["prefill video KV cache"]
+  NoiseA["latents_action ~ N(0,I)"] --> Loop["N-step action denoise loop"]
+  Cache --> Loop
+  Loop --> APre["action pre_dit(latents_action, t_k)"]
+  APre --> MoTCache["MoT forward_action_with_video_cache"]
+  MoTCache --> PredA["pred_action velocity"]
+  PredA --> Step["scheduler.step with Δσ_k"]
+  Step --> Loop
+  Loop --> Out["action chunk"]
+```
+
+这正是「Fast」之所在：视频分支不做 20 步未来想象，只提供一次性当前观测条件；动作分支完成全部反向积分。
+
+### 17.11 推理路径二：`infer_joint` 同时对 video/action 做反向积分
+
+`infer_joint` 保留完整 WAM 想象路径：video 与 action 同步去噪。
+
+```854:890:src/fastwam/models/wan22/fastwam.py
+        infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_video.dtype,
+            shift_override=sigma_shift,
+        )
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
+            infer_timesteps_video,
+            infer_deltas_video,
+            infer_timesteps_action,
+            infer_deltas_action,
+        ):
+            timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            ...
+            latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            latents_video[:, :, 0:1] = first_frame_latents.clone()
+```
+
+速度预测由 `_predict_joint_noise` 负责：
+
+```570:632:src/fastwam/models/wan22/fastwam.py
+    def _predict_joint_noise(
+        self,
+        latents_video: torch.Tensor,
+        latents_action: torch.Tensor,
+        timestep_video: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        gt_action: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_pre = self.video_expert.pre_dit(
+            x=latents_video,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=gt_action,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        ...
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        return pred_video, pred_action
+```
+
+`infer_joint` 的代价显著更高，因为 video tokens 数远大于 action tokens；但它能产生未来视频。FastWAM 的实验结论是：这类 test-time future imagination 对动作成功率收益很小，因此部署默认走 `infer_action`。
+
+### 17.12 训练 vs 推理的调用流 UML / Mermaid
+
+三条主要调用流如下：
+
+```mermaid
+flowchart TB
+  subgraph TrainFlow ["训练 training_loss"]
+    T0["sample batch"] --> T1["build_inputs"]
+    T1 --> T2["train schedulers sample t"]
+    T2 --> T3["add_noise video/action"]
+    T3 --> T4["video_pre + action_pre"]
+    T4 --> T5["MoT.forward mixed attention"]
+    T5 --> T6["post_dit pred velocities"]
+    T6 --> T7["weighted MSE loss"]
+  end
+
+  subgraph FastInfer ["快推理 infer_action"]
+    F0["input_image"] --> F1["video_pre σ=0"]
+    F1 --> F2["prefill video KV"]
+    F2 --> F3["action denoise loop"]
+    F3 --> F4["action chunk"]
+  end
+
+  subgraph JointInfer ["联合推理 infer_joint"]
+    J0["video noise + action noise"] --> J1["joint denoise loop"]
+    J1 --> J2["video frames + action chunk"]
+  end
+```
+
+从训练到推理，代码结构存在一个很重要的「同构性」：训练与 `infer_joint` 都走 `video_pre + action_pre + MoT.forward + post_dit`；`infer_action` 则把 video 部分改成 `prefill_video_cache`，把最重的视频计算移出循环。
+
+### 17.13 与同类工作的纵横对比
+
+**纵向演化**：
+
+1. **DDPM / DDIM**：从噪声到图像，多步扩散反推，经典目标是噪声或 \(x_0\)；
+2. **Diffusion Policy**：把扩散生成从图像搬到 action chunk，解决多峰动作分布；
+3. **Flow Matching / Rectified Flow**：用连续直线流与速度场统一训练/推理；
+4. **\(\pi_0\)**：大规模机器人策略中用 flow matching 生成动作；
+5. **FastWAM**：不仅对 action 做 flow matching，还训练 video flow matching；但推理时发现 video 未来想象可省。
+
+**横向比较**：
+
+| 方法类型 | 是否建模未来视频 | 是否生成动作 chunk | 推理是否需要未来想象 |
+|----------|------------------|--------------------|----------------------|
+| Diffusion Policy | 否 | 是 | 否 |
+| \(\pi_0\) / VLA flow policy | 通常否 | 是 | 否 |
+| 传统 WAM / imagine-then-execute | 是 | 是 | 通常是 |
+| FastWAM | **训练是** | 是 | **默认否** |
+
+FastWAM 的关键折中是：**把 video flow matching 当作训练期辅助世界建模，而不是部署期必须执行的未来生成步骤。**
+
+### 17.14 小结
+
+| 阶段 | Video 分支 | Action 分支 | 二者关系 |
+|------|------------|-------------|----------|
+| 训练加噪 | VAE latent 加噪，首帧 clean | action chunk 加噪 | 各自独立采 \(\sigma\) |
+| 训练前向 | `video_expert.pre_dit` | `action_expert.pre_dit` | MoT mixed attention 融合 |
+| 训练目标 | 预测 \(\epsilon_v-z_0\) | 预测 \(\epsilon_a-a_0\) | 加权 MSE 相加 |
+| `infer_action` | σ=0 当前观测，KV cache 一次 | N 步 flow 反向积分 | 快路径，部署默认 |
+| `infer_joint` | N 步生成未来视频 | N 步生成动作 | 完整 WAM，成本更高 |
+
+**一句话总结**：FastWAM 在训练时用 video/action 双流 flow matching 共同学习「世界如何变化」与「动作如何生成」，通过 MoT 让两条速度场在 30 层中交互；推理时则把 video 流压缩成一次当前观测编码，只沿 action 流反向积分，从而保留 world-model 训练收益，同时避开 test-time future imagination 的主要延迟。**
+
