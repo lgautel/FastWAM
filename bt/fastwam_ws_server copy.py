@@ -37,7 +37,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import websockets.asyncio.server as _server
 import websockets.frames
@@ -59,6 +58,10 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.utils.config_resolvers import register_default_resolvers  # noqa: E402
 from fastwam.datasets.lerobot.utils.normalizer import (  # noqa: E402
     load_dataset_stats_from_json,
+)
+from fastwam.datasets.dataset_utils import (  # noqa: E402
+    CenterCrop,
+    ResizeSmallestSideAspectPreserving,
 )
 
 # msgpack: match the deployment client's custom ndarray wrapper.
@@ -91,21 +94,6 @@ logger = logging.getLogger(__name__)
 # ─── helpers ─────────────────────────────────────────────────
 
 
-def _configure_logging(log_file: str | Path | None = None) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        log_path = Path(log_file).expanduser()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-
-
 def _normalize_mp(mp: str) -> str:
     key = str(mp).strip().lower()
     if key not in {"no", "fp16", "bf16"}:
@@ -125,8 +113,8 @@ def _compose_cfg(task: str, overrides: list[str]) -> DictConfig:
         return compose(config_name="train", overrides=[f"task={task}", *overrides])
 
 
-def _to_chw_uint8_device(img: np.ndarray, device: str | torch.device) -> torch.Tensor:
-    """HWC/CHW image -> CHW uint8 tensor on target device."""
+def _to_chw_float(img: np.ndarray) -> torch.Tensor:
+    """HWC uint8/float -> CHW float in [0, 1]."""
     arr = np.asarray(img)
     if arr.ndim != 3:
         raise ValueError(f"image must be HxWx3, got {arr.shape}")
@@ -134,68 +122,13 @@ def _to_chw_uint8_device(img: np.ndarray, device: str | torch.device) -> torch.T
         arr = np.transpose(arr, (1, 2, 0))
     if arr.shape[2] != 3:
         raise ValueError(f"image must have 3 channels, got {arr.shape}")
-    if arr.dtype != np.uint8:
-        arr = arr.astype(np.float32)
-        if float(np.nanmax(arr)) <= 1.5:
-            arr = arr * 255.0
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-    t = torch.from_numpy(np.ascontiguousarray(arr))
-    return t.to(device=device, non_blocking=True).permute(2, 0, 1)
-
-
-def _chw_to_float01(t: torch.Tensor) -> torch.Tensor:
-    if t.dtype == torch.uint8:
-        return t.to(dtype=torch.float32) / 255.0
-    return t.to(dtype=torch.float32)
-
-
-_TV_INTERP_MODES = {
-    "bilinear": TF.InterpolationMode.BILINEAR,
-    "bicubic": TF.InterpolationMode.BICUBIC,
-    "nearest": TF.InterpolationMode.NEAREST,
-}
-
-
-def _resize_chw(
-    image: torch.Tensor,
-    size: tuple[int, int],
-    *,
-    mode: str,
-) -> torch.Tensor:
-    image = _chw_to_float01(image)
-    if tuple(image.shape[-2:]) == tuple(size):
-        return image
-    if mode not in _TV_INTERP_MODES:
-        raise ValueError(f"unsupported resize mode={mode}")
-    return TF.resize(
-        image,
-        size=list(size),
-        interpolation=_TV_INTERP_MODES[mode],
-        antialias=True,
-    )
-
-
-def _resize_smallest_side_chw(
-    image: torch.Tensor,
-    *,
-    img_h: int,
-    img_w: int,
-    mode: str = "bicubic",
-) -> torch.Tensor:
-    orig_h, orig_w = image.shape[-2:]
-    scaling_ratio = max((img_w / orig_w), (img_h / orig_h))
-    target_size = (int(scaling_ratio * orig_h + 0.5), int(scaling_ratio * orig_w + 0.5))
-    return _resize_chw(image, target_size, mode=mode)
-
-
-def _center_crop_chw(image: torch.Tensor, *, img_h: int, img_w: int) -> torch.Tensor:
-    h, w = image.shape[-2:]
-    if h < img_h or w < img_w:
-        raise ValueError(f"cannot center crop image {(h, w)} to {(img_h, img_w)}")
-    top = (h - img_h) // 2
-    left = (w - img_w) // 2
-    return image[..., top : top + img_h, left : left + img_w]
+    if arr.dtype == np.uint8:
+        t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+    else:
+        t = torch.from_numpy(arr.astype(np.float32)).permute(2, 0, 1)
+        if float(t.max()) > 1.5:
+            t = t / 255.0
+    return t
 
 
 def _as_hwc_uint8(img: np.ndarray) -> np.ndarray:
@@ -227,94 +160,21 @@ def _model_input_to_hwc_uint8(model_input: torch.Tensor) -> np.ndarray:
 class _ClientFrameSaver:
     def __init__(self, output_dir: str | Path) -> None:
         self._output_dir = Path(output_dir).expanduser()
+        self._saved = False
         self._lock = threading.Lock()
 
-    @staticmethod
-    def _frame_stamp(ref_time: Any) -> str:
-        if ref_time is None:
-            return dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        if isinstance(ref_time, np.ndarray):
-            ref_time = ref_time.reshape(-1)[0].item() if ref_time.size else None
-        if ref_time is None:
-            return dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        # Keep it filesystem-safe (strip path separators / spaces).
-        return str(ref_time).replace("/", "-").replace(" ", "_").replace(":", "-")
-
-    def save(
-        self,
-        obs: dict[str, Any],
-        model_input: torch.Tensor,
-        *,
-        request_id: int | None = None,
-    ) -> Path | None:
+    def save_once(self, obs: dict[str, Any], model_input: torch.Tensor) -> Path | None:
         with self._lock:
-            stamp = self._frame_stamp(obs.get("ref_time"))
-            frame_dir = self._output_dir / stamp
-            frame_dir.mkdir(parents=True, exist_ok=True)
+            if self._saved:
+                return None
+            self._output_dir.mkdir(parents=True, exist_ok=True)
             for key in ("head_rgb", "left_wrist_rgb", "right_wrist_rgb"):
-                Image.fromarray(_as_hwc_uint8(obs[key])).save(frame_dir / f"{key}.png")
+                Image.fromarray(_as_hwc_uint8(obs[key])).save(self._output_dir / f"{key}.png")
             Image.fromarray(_model_input_to_hwc_uint8(model_input)).save(
-                frame_dir / "model_input.png"
+                self._output_dir / "model_input.png"
             )
-            return frame_dir
-
-
-# Layout of the flat 23-dim state/action vector (see send_dataset_to_ws.py):
-#   left_arm(7), right_arm(7), left_gripper(1), right_gripper(1), torso(4), chassis(3)
-_STATE_ACTION_LAYOUT: tuple[tuple[str, int], ...] = (
-    ("left_arm", 7),
-    ("right_arm", 7),
-    ("left_gripper", 1),
-    ("right_gripper", 1),
-    ("torso", 4),
-    ("chassis", 3),
-)
-
-
-def _flat_component_labels(prefix: str, expected_dim: int | None = None) -> list[str]:
-    labels: list[str] = []
-    for name, n in _STATE_ACTION_LAYOUT:
-        if n == 1:
-            labels.append(f"{prefix}_{name}")
-        else:
-            labels.extend(f"{prefix}_{name}_{i}" for i in range(n))
-    if expected_dim is not None and len(labels) != expected_dim:
-        # Layout doesn't match the configured dim; fall back to plain indices.
-        return [f"{prefix}_{i}" for i in range(expected_dim)]
-    return labels
-
-
-def _write_frame_state_action_csv(
-    csv_path: str | Path,
-    *,
-    state: np.ndarray,
-    actions: np.ndarray,
-) -> None:
-    """Save this frame's obs state and the inferred action chunk next to its images."""
-    state_np = np.asarray(state, dtype=np.float32).reshape(-1)
-    actions_np = np.asarray(actions, dtype=np.float32)
-    if actions_np.ndim == 1:
-        actions_np = actions_np[None, :]
-    if actions_np.ndim != 2:
-        raise ValueError(f"actions must be [T, A], got {actions_np.shape}")
-
-    state_labels = _flat_component_labels("state", state_np.shape[0])
-    action_labels = _flat_component_labels("action", actions_np.shape[1])
-    header = ["chunk_offset", *state_labels, *action_labels]
-
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        for chunk_offset, action in enumerate(actions_np):
-            writer.writerow(
-                [
-                    int(chunk_offset),
-                    *[float(v) for v in state_np],
-                    *[float(v) for v in action],
-                ]
-            )
+            self._saved = True
+            return self._output_dir
 
 
 class _StateActionCsvLogger:
@@ -329,14 +189,8 @@ class _StateActionCsvLogger:
         self._csv_path = Path(csv_path).expanduser()
         self._state_dim = int(state_dim)
         self._action_dim = int(action_dim)
-        self._state_labels = _flat_component_labels("state", self._state_dim)
-        self._action_labels = _flat_component_labels("action", self._action_dim)
         self._timestamp_fn = timestamp_fn or self._utc_timestamp
         self._lock = threading.Lock()
-        # Start a fresh CSV on each server launch instead of appending across restarts.
-        self._csv_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._csv_path, "w", encoding="utf-8", newline=""):
-            pass
 
     @staticmethod
     def _utc_timestamp() -> str:
@@ -364,8 +218,8 @@ class _StateActionCsvLogger:
         timestamp = self._timestamp_fn()
         header = (
             ["timestamp", "request_id", "chunk_offset", "prompt", "infer_ms", "total_ms"]
-            + self._state_labels
-            + self._action_labels
+            + [f"state_{i}" for i in range(self._state_dim)]
+            + [f"action_{i}" for i in range(self._action_dim)]
         )
         with self._lock:
             self._csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,7 +303,7 @@ class FastWAMAdapter:
 
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if str(dev).startswith("cuda") and not torch.cuda.is_available():
-            logger.info("[fastwam_ws] CUDA unavailable, falling back to cpu")
+            print("[fastwam_ws] CUDA unavailable, falling back to cpu", flush=True)
             dev = "cpu"
         self._device = dev
 
@@ -464,14 +318,13 @@ class FastWAMAdapter:
         # ---- model ----
         model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
         model_cfg.load_text_encoder = bool(load_text_encoder)
-        logger.info(
-            "[fastwam_ws] instantiating model (load_text_encoder=%s) dtype=%s device=%s",
-            model_cfg.load_text_encoder,
-            self._dtype,
-            dev,
+        print(
+            f"[fastwam_ws] instantiating model (load_text_encoder={model_cfg.load_text_encoder}) "
+            f"dtype={self._dtype} device={dev}",
+            flush=True,
         )
         model = instantiate(model_cfg, model_dtype=self._dtype, device=str(dev))
-        logger.info("[fastwam_ws] loading checkpoint: %s", self._checkpoint)
+        print(f"[fastwam_ws] loading checkpoint: {self._checkpoint}", flush=True)
         model.load_checkpoint(str(self._checkpoint))
         model.eval()
         self._model = model
@@ -488,6 +341,12 @@ class FastWAMAdapter:
         video_size = list(cfg.data.train.video_size)
         self._video_h, self._video_w = int(video_size[0]), int(video_size[1])
         self._concat_mode = str(cfg.data.train.get("concat_multi_camera", "robotwin"))
+        self._resize_transform = ResizeSmallestSideAspectPreserving(
+            args={"img_w": self._video_w, "img_h": self._video_h},
+        )
+        self._crop_transform = CenterCrop(
+            args={"img_w": self._video_w, "img_h": self._video_h},
+        )
 
         self._image_metas = list(cfg.data.train.shape_meta.images)
         self._action_metas = list(cfg.data.train.shape_meta.action)
@@ -502,7 +361,6 @@ class FastWAMAdapter:
         )
 
         self._default_prompt = default_prompt
-        self._prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._client_frame_saver = (
             _ClientFrameSaver(save_client_frame_dir)
             if save_client_frame_dir is not None
@@ -522,7 +380,7 @@ class FastWAMAdapter:
             try:
                 self._warmup()
             except Exception as e:  # noqa: BLE001
-                logger.info("[fastwam_ws] warmup skipped: %s: %s", type(e).__name__, e)
+                print(f"[fastwam_ws] warmup skipped: {type(e).__name__}: {e}", flush=True)
 
     # ── preprocessing ─────────────────────────────────────────
 
@@ -533,39 +391,43 @@ class FastWAMAdapter:
         right: np.ndarray,
     ) -> torch.Tensor:
         """3 raw RGBs -> [1, 3, H, W] in [-1, 1] (matches RobotVideoDataset.robotwin layout)."""
-        head_t = _to_chw_uint8_device(head, self._device)
-        left_t = _to_chw_uint8_device(left, self._device)
-        right_t = _to_chw_uint8_device(right, self._device)
+        video = torch.stack(
+            [_to_chw_float(head), _to_chw_float(left), _to_chw_float(right)],
+            dim=0,
+        )  # [num_cameras, C, H, W]
 
         if self._concat_mode == "robotwin":
-            cam_top = _resize_chw(head_t, (256, 320), mode="bilinear")
-            cam_left = _resize_chw(left_t, (128, 160), mode="bilinear")
-            cam_right = _resize_chw(right_t, (128, 160), mode="bilinear")
+            cam_top = TF.resize(
+                video[0],
+                size=[256, 320],
+                interpolation=TF.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            cam_left = TF.resize(
+                video[1],
+                size=[128, 160],
+                interpolation=TF.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            cam_right = TF.resize(
+                video[2],
+                size=[128, 160],
+                interpolation=TF.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
             bottom = torch.cat([cam_left, cam_right], dim=-1)        # [3, 128, 320]
             video = torch.cat([cam_top, bottom], dim=-2)              # [3, 384, 320]
         elif self._concat_mode == "horizontal":
-            video = torch.cat(
-                [_chw_to_float01(head_t), _chw_to_float01(left_t), _chw_to_float01(right_t)],
-                dim=-1,
-            )
+            video = torch.cat([video[i] for i in range(video.shape[0])], dim=-1)
         elif self._concat_mode == "vertical":
-            video = torch.cat(
-                [_chw_to_float01(head_t), _chw_to_float01(left_t), _chw_to_float01(right_t)],
-                dim=-2,
-            )
+            video = torch.cat([video[i] for i in range(video.shape[0])], dim=-2)
         else:
             raise ValueError(f"unknown concat_multi_camera={self._concat_mode}")
 
-        video = _resize_smallest_side_chw(
-            video,
-            img_h=self._video_h,
-            img_w=self._video_w,
-            mode="bicubic",
-        )
-        video = _center_crop_chw(video, img_h=self._video_h, img_w=self._video_w)
-        video = video.clamp(0.0, 1.0)
+        video = self._resize_transform(video)
+        video = self._crop_transform(video)
         video = (video - 0.5) / 0.5  # -> [-1, 1]
-        return video.unsqueeze(0).to(dtype=self._dtype)
+        return video.unsqueeze(0).to(device=self._device, dtype=self._dtype)
 
     def _prep_proprio(self, state: np.ndarray) -> torch.Tensor:
         """raw state (A_real,) -> [1, proprio_output_dim] normalized + merged."""
@@ -643,11 +505,7 @@ class FastWAMAdapter:
         if not actual:
             raise ValueError("no `prompt` in obs and no --default-prompt configured")
         formatted = DEFAULT_PROMPT.format(task=actual)
-        cached = self._prompt_cache.get(formatted)
-        if cached is not None:
-            return cached  # [1, L, D] / [1, L]
         ctx, mask = self._model.encode_prompt(formatted)
-        self._prompt_cache[formatted] = (ctx, mask)
         return ctx, mask  # [1, L, D] / [1, L]
 
     def predict(
@@ -661,20 +519,17 @@ class FastWAMAdapter:
             if k not in obs:
                 raise KeyError(f"obs missing required key: {k}")
         prompt = obs.get("prompt", None) or self._default_prompt
-        logger.info("[fastwam_ws] infer begin: %s", _describe_obs(obs))
+        print(f"[fastwam_ws] infer begin: {_describe_obs(obs)}", flush=True)
 
         t_total = time.monotonic()
-        saved_dir: Path | None = None
         with torch.no_grad():
             input_image = self._prep_image(
                 obs["head_rgb"], obs["left_wrist_rgb"], obs["right_wrist_rgb"]
             )
             if save_client_frame and self._client_frame_saver is not None:
-                saved_dir = self._client_frame_saver.save(
-                    obs, input_image, request_id=request_id
-                )
+                saved_dir = self._client_frame_saver.save_once(obs, input_image)
                 if saved_dir is not None:
-                    logger.info("[fastwam_ws] saved client frame: %s", saved_dir)
+                    print(f"[fastwam_ws] saved client frame: {saved_dir}", flush=True)
             proprio_norm = self._prep_proprio(
                 np.asarray(obs["state"], dtype=np.float32).reshape(-1)
             )
@@ -703,12 +558,6 @@ class FastWAMAdapter:
             actions_np = self._denorm_action(out["action"], proprio_norm)
 
         total_ms = (time.monotonic() - t_total) * 1000.0
-        if saved_dir is not None:
-            _write_frame_state_action_csv(
-                saved_dir / "state_action.csv",
-                state=np.asarray(obs["state"], dtype=np.float32).reshape(-1),
-                actions=actions_np,
-            )
         if self._state_action_logger is not None and request_id is not None:
             self._state_action_logger.append(
                 request_id=request_id,
@@ -718,11 +567,10 @@ class FastWAMAdapter:
                 infer_ms=infer_ms,
                 total_ms=total_ms,
             )
-        logger.info(
-            "[fastwam_ws] infer done: actions_shape=%s model_infer_ms=%.1f total_ms=%.1f",
-            actions_np.shape,
-            infer_ms,
-            total_ms,
+        print(
+            f"[fastwam_ws] infer done: actions_shape={actions_np.shape} "
+            f"model_infer_ms={infer_ms:.1f} total_ms={total_ms:.1f}",
+            flush=True,
         )
         return {
             "actions": actions_np,
@@ -730,7 +578,7 @@ class FastWAMAdapter:
         }
 
     def _warmup(self) -> None:
-        logger.info("[fastwam_ws] warmup ...")
+        print("[fastwam_ws] warmup ...", flush=True)
         h, w = 480, 640
         dummy = {
             "head_rgb": np.random.randint(0, 256, (h, w, 3), dtype=np.uint8),
@@ -741,7 +589,7 @@ class FastWAMAdapter:
         }
         t0 = time.monotonic()
         self.predict(dummy, save_client_frame=False)
-        logger.info("[fastwam_ws] warmup done in %.1f ms", (time.monotonic() - t0) * 1000.0)
+        print(f"[fastwam_ws] warmup done in {(time.monotonic() - t0) * 1000.0:.1f} ms", flush=True)
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -782,20 +630,18 @@ class FastWAMPolicyServer:
             process_request=_health_check,
         ) as server:
             health_host = "127.0.0.1" if self._host in ("0.0.0.0", "::", "[::]") else self._host
-            logger.info(
-                "[fastwam_ws] listening ws://%s:%s  healthz: curl -s http://%s:%s/healthz",
-                self._host,
-                self._port,
-                health_host,
-                self._port,
+            print(
+                f"[fastwam_ws] listening ws://{self._host}:{self._port}  "
+                f"healthz: curl -s http://{health_host}:{self._port}/healthz",
+                flush=True,
             )
             await server.serve_forever()
 
     async def _handler(self, ws: _server.ServerConnection) -> None:
-        logger.info("[fastwam_ws] client connected: %s", ws.remote_address)
+        print(f"[fastwam_ws] client connected: {ws.remote_address}", flush=True)
         packer = msgpack_numpy.Packer()
         await ws.send(packer.pack(self._metadata))
-        logger.info("[fastwam_ws] metadata sent: %s", self._metadata)
+        print(f"[fastwam_ws] metadata sent: {self._metadata}", flush=True)
 
         prev_total: float | None = None
         req_id = 0
@@ -804,7 +650,7 @@ class FastWAMPolicyServer:
                 t_start = time.monotonic()
                 obs = msgpack_numpy.unpackb(await ws.recv())
                 req_id += 1
-                logger.info("[fastwam_ws] request #%s received", req_id)
+                print(f"[fastwam_ws] request #{req_id} received", flush=True)
 
                 t_inf = time.monotonic()
                 action = await asyncio.to_thread(self._adapter.predict, obs, request_id=req_id)
@@ -815,18 +661,17 @@ class FastWAMPolicyServer:
 
                 await ws.send(packer.pack(action))
                 prev_total = time.monotonic() - t_start
-                logger.info(
-                    "[fastwam_ws] response #%s server_infer_ms=%.1f total_ms=%.1f",
-                    req_id,
-                    infer_ms,
-                    prev_total * 1000.0,
+                print(
+                    f"[fastwam_ws] response #{req_id} server_infer_ms={infer_ms:.1f} "
+                    f"total_ms={prev_total * 1000.0:.1f}",
+                    flush=True,
                 )
             except __import__("websockets").ConnectionClosed:
-                logger.info("[fastwam_ws] client disconnected: %s", ws.remote_address)
+                print(f"[fastwam_ws] client disconnected: {ws.remote_address}", flush=True)
                 break
             except Exception:
                 tb = traceback.format_exc()
-                logger.error("[fastwam_ws] error:\n%s", tb)
+                print(f"[fastwam_ws] error:\n{tb}", flush=True)
                 try:
                     await ws.send(tb)
                 except Exception:
@@ -865,12 +710,9 @@ def main() -> None:
     ap.add_argument("--mixed-precision", type=str, default=None, choices=["no", "fp16", "bf16"])
     ap.add_argument("--default-prompt", type=str, default=None)
     ap.add_argument("--save-client-frame-dir", type=str, default=None,
-                    help="If set, save every client frame's raw cameras and model input PNGs here, "
-                         "one timestamped subfolder per request.")
+                    help="If set, save the first real client frame's raw cameras and model input PNGs here.")
     ap.add_argument("--log-state-action-csv", type=str, default=None,
                     help="If set, append each request's raw state and denormalized action chunk to this CSV.")
-    ap.add_argument("--log-file", type=str, default="./logs/ws_infer.log",
-                    help="Write logger.info output to this file as well as stdout. Use an empty string to disable.")
     ap.add_argument("--no-text-encoder", action="store_true",
                     help="Skip loading the T5 text encoder (only useful if you patch in cached embeddings).")
     ap.add_argument("--no-warmup", action="store_true")
@@ -878,14 +720,11 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    _configure_logging(args.log_file)
-    logger.info(
-        "[fastwam_ws] start task=%s ckpt=%s ws://%s:%s device=%s",
-        args.task,
-        args.checkpoint,
-        args.host,
-        args.port,
-        args.device,
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    print(
+        f"[fastwam_ws] start task={args.task} ckpt={args.checkpoint} "
+        f"ws://{args.host}:{args.port} device={args.device}",
+        flush=True,
     )
 
     adapter = FastWAMAdapter(

@@ -96,7 +96,10 @@ class ActionDiT(nn.Module):
             ]
         )
         self.head = nn.Linear(hidden_dim, action_dim)
-        self.freqs = precompute_freqs_cis(attn_head_dim, end=1024)
+        # 注册成非持久 buffer，这样 `.to(device)` 会把 RoPE 频率搬到 GPU；
+        # 否则它常驻 CPU，pre_dit 里的 `.to(tokens.device)` 会在编译图里引入 CPU 张量，
+        # 导致 torch.compile(reduce-overhead) 放弃 cudagraph。persistent=False 不进 state_dict。
+        self.register_buffer("freqs", precompute_freqs_cis(attn_head_dim, end=1024), persistent=False)
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 

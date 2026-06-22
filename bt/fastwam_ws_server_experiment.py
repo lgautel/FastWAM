@@ -117,6 +117,52 @@ def _mp_to_dtype(mp: str) -> torch.dtype:
     return {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[_normalize_mp(mp)]
 
 
+# Per-camera RGB color statistics (per-channel mean/std over 0-255), measured from the
+# saved client frames in logs/ws_client_frame{,_trainsets}/ (see tmp/color_stats.py).
+#   train_* : training-domain distribution (dataset frames replayed through this server) -- the target.
+#   real_*  : confirmed real-robot frames -- used as the fixed source baseline by mode="fixed".
+# The real camera system is systematically desaturated / cooler (less red+yellow) than training,
+# so we Reinhard-match raw frames back to the training distribution before inference.
+_COLOR_MATCH_STATS: dict[str, dict[str, tuple[float, float, float]]] = {
+    "head_rgb": {
+        "train_mean": (127.09, 72.47, 52.96),
+        "train_std": (37.51, 36.24, 46.06),
+        "real_mean": (129.15, 113.76, 103.17),
+        "real_std": (35.51, 34.01, 41.81),
+    },
+    "left_wrist_rgb": {
+        "train_mean": (106.93, 102.21, 100.36),
+        "train_std": (52.48, 44.92, 47.98),
+        "real_mean": (105.75, 105.79, 103.57),
+        "real_std": (55.08, 55.27, 57.11),
+    },
+    "right_wrist_rgb": {
+        "train_mean": (100.60, 92.02, 89.89),
+        "train_std": (57.73, 53.05, 55.53),
+        "real_mean": (106.73, 105.30, 103.92),
+        "real_std": (61.40, 61.63, 64.40),
+    },
+}
+
+_COLOR_MATCH_MODES = ("off", "fixed", "adaptive")
+
+
+def _normalize_color_match(mode: str | None) -> str:
+    key = str(mode if mode is not None else "off").strip().lower()
+    if key not in _COLOR_MATCH_MODES:
+        raise ValueError(
+            f"Unsupported color_match mode: {mode!r}; want one of {_COLOR_MATCH_MODES}"
+        )
+    return key
+
+
+def _normalize_color_match_strength(strength: float) -> float:
+    value = float(strength)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"color_match_strength must be in [0, 1], got {strength}")
+    return value
+
+
 def _compose_cfg(task: str, overrides: list[str]) -> DictConfig:
     register_default_resolvers()
     if GlobalHydra.instance().is_initialized():
@@ -406,6 +452,58 @@ def _describe_obs(obs: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+class _TwoClientObsMixer:
+    """Cache full observations from two roles and splice image/state fields."""
+
+    _IMAGE_KEYS = ("head_rgb", "left_wrist_rgb", "right_wrist_rgb")
+
+    def __init__(self, *, image_role: str = "image", state_role: str = "state") -> None:
+        self._image_role = image_role
+        self._state_role = state_role
+        self._image_obs: dict[str, Any] | None = None
+        self._state_obs: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def roles(self) -> tuple[str, str]:
+        return self._image_role, self._state_role
+
+    def update(self, obs: dict[str, Any]) -> dict[str, Any] | None:
+        role = str(obs.get("role", ""))
+        if role not in self.roles:
+            raise ValueError(
+                f"obs role must be {self._image_role!r} or {self._state_role!r}, got {role!r}"
+            )
+
+        with self._lock:
+            if role == self._image_role:
+                self._image_obs = obs
+            else:
+                self._state_obs = obs
+
+            if self._image_obs is None or self._state_obs is None:
+                return None
+
+            image_obs = self._image_obs
+            state_obs = self._state_obs
+            mixed = dict(image_obs)
+            for key in self._IMAGE_KEYS:
+                mixed[key] = image_obs[key]
+            mixed["state"] = state_obs["state"]
+            mixed["prompt"] = image_obs.get("prompt") or state_obs.get("prompt")
+            if "ref_time" in image_obs:
+                mixed["ref_time"] = image_obs["ref_time"]
+            elif "ref_time" in state_obs:
+                mixed["ref_time"] = state_obs["ref_time"]
+            mixed["role"] = "mixed"
+            mixed["mixed_sources"] = {
+                "image_role": self._image_role,
+                "state_role": self._state_role,
+                "trigger_role": role,
+            }
+            return mixed
+
+
 # ─── Adapter ─────────────────────────────────────────────────
 
 
@@ -432,6 +530,8 @@ class FastWAMAdapter:
         warmup: bool = True,
         save_client_frame_dir: str | Path | None = None,
         log_state_action_csv: str | Path | None = None,
+        color_match: str = "off",
+        color_match_strength: float = 1.0,
     ) -> None:
         self._task = task
         self._checkpoint = Path(checkpoint).expanduser().resolve()
@@ -452,6 +552,30 @@ class FastWAMAdapter:
             logger.info("[fastwam_ws] CUDA unavailable, falling back to cpu")
             dev = "cpu"
         self._device = dev
+
+        # ---- color match (raw real frames -> training distribution) ----
+        self._color_match = _normalize_color_match(color_match)
+        self._color_match_strength = _normalize_color_match_strength(color_match_strength)
+        self._color_match_tensors: dict[str, tuple[torch.Tensor, ...]] = {}
+        if self._color_match != "off":
+            for cam_key, s in _COLOR_MATCH_STATS.items():
+                def _v(name: str) -> torch.Tensor:
+                    return torch.tensor(
+                        s[name], dtype=torch.float32, device=self._device
+                    ).view(3, 1, 1)
+
+                self._color_match_tensors[cam_key] = (
+                    _v("train_mean"),
+                    _v("train_std"),
+                    _v("real_mean"),
+                    _v("real_std"),
+                )
+            logger.info(
+                "[fastwam_ws] color match enabled: mode=%s strength=%.3f cams=%s",
+                self._color_match,
+                self._color_match_strength,
+                list(self._color_match_tensors),
+            )
 
         # ---- processor (normalizer + merger) ----
         proc_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.train.processor, resolve=True))
@@ -526,6 +650,29 @@ class FastWAMAdapter:
 
     # ── preprocessing ─────────────────────────────────────────
 
+    def _color_match_chw(self, t_uint8: torch.Tensor, cam_key: str) -> torch.Tensor:
+        """Reinhard per-channel match of a CHW uint8 RGB frame to the training distribution.
+
+        mode="fixed":    source stats are the constant real-robot baseline (temporally stable).
+        mode="adaptive": source stats are computed from this frame itself (self-calibrating).
+        Returns a CHW uint8 tensor; a no-op when color match is off or stats are missing.
+        """
+        stats = self._color_match_tensors.get(cam_key)
+        if self._color_match == "off" or stats is None:
+            return t_uint8
+        tgt_mean, tgt_std, real_mean, real_std = stats
+        x = t_uint8.to(dtype=torch.float32)
+        if self._color_match == "adaptive":
+            src_mean = x.mean(dim=(1, 2), keepdim=True)
+            src_std = x.std(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        else:  # "fixed"
+            src_mean = real_mean
+            src_std = real_std
+        y = (x - src_mean) / src_std * tgt_std + tgt_mean
+        if self._color_match_strength < 1.0:
+            y = x.lerp(y, self._color_match_strength)
+        return y.clamp_(0.0, 255.0).to(dtype=torch.uint8)
+
     def _prep_image(
         self,
         head: np.ndarray,
@@ -533,9 +680,9 @@ class FastWAMAdapter:
         right: np.ndarray,
     ) -> torch.Tensor:
         """3 raw RGBs -> [1, 3, H, W] in [-1, 1] (matches RobotVideoDataset.robotwin layout)."""
-        head_t = _to_chw_uint8_device(head, self._device)
-        left_t = _to_chw_uint8_device(left, self._device)
-        right_t = _to_chw_uint8_device(right, self._device)
+        head_t = self._color_match_chw(_to_chw_uint8_device(head, self._device), "head_rgb")
+        left_t = self._color_match_chw(_to_chw_uint8_device(left, self._device), "left_wrist_rgb")
+        right_t = self._color_match_chw(_to_chw_uint8_device(right, self._device), "right_wrist_rgb")
 
         if self._concat_mode == "robotwin":
             cam_top = _resize_chw(head_t, (256, 320), mode="bilinear")
@@ -763,11 +910,31 @@ class FastWAMAdapter:
 
 
 class FastWAMPolicyServer:
-    def __init__(self, adapter: FastWAMAdapter, host: str, port: int) -> None:
+    def __init__(
+        self,
+        adapter: FastWAMAdapter,
+        host: str,
+        port: int,
+        *,
+        mix_two_client_obs: bool = False,
+        image_role: str = "image",
+        state_role: str = "state",
+    ) -> None:
         self._adapter = adapter
         self._host = host
         self._port = port
+        self._obs_mixer = (
+            _TwoClientObsMixer(image_role=image_role, state_role=state_role)
+            if mix_two_client_obs
+            else None
+        )
         self._metadata = adapter.metadata
+        if self._obs_mixer is not None:
+            self._metadata = dict(self._metadata)
+            self._metadata["mix_two_client_obs"] = {
+                "image_role": image_role,
+                "state_role": state_role,
+            }
 
     def serve_forever(self) -> None:
         asyncio.run(self._run())
@@ -805,9 +972,32 @@ class FastWAMPolicyServer:
                 obs = msgpack_numpy.unpackb(await ws.recv())
                 req_id += 1
                 logger.info("[fastwam_ws] request #%s received", req_id)
+                obs_for_predict = obs
+                if self._obs_mixer is not None and "role" in obs:
+                    obs_for_predict = self._obs_mixer.update(obs)
+                    if obs_for_predict is None:
+                        await ws.send(
+                            packer.pack(
+                                {
+                                    "status": "waiting_for_pair",
+                                    "server_timing": {"infer_ms": 0.0},
+                                }
+                            )
+                        )
+                        logger.info(
+                            "[fastwam_ws] request #%s cached role=%s; waiting for both roles",
+                            req_id,
+                            obs.get("role"),
+                        )
+                        continue
+                    logger.info(
+                        "[fastwam_ws] request #%s using mixed obs from roles=%s",
+                        req_id,
+                        self._obs_mixer.roles,
+                    )
 
                 t_inf = time.monotonic()
-                action = await asyncio.to_thread(self._adapter.predict, obs, request_id=req_id)
+                action = await asyncio.to_thread(self._adapter.predict, obs_for_predict, request_id=req_id)
                 infer_ms = (time.monotonic() - t_inf) * 1000.0
                 action.setdefault("server_timing", {})["infer_ms"] = infer_ms
                 if prev_total is not None:
@@ -876,6 +1066,22 @@ def main() -> None:
     ap.add_argument("--no-warmup", action="store_true")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--mix-two-client-obs", action="store_true",
+                    help="Treat role-tagged full obs messages from two clients as image/state sources.")
+    ap.add_argument("--image-role", type=str, default="image",
+                    help="Role value whose obs supplies head/left/right images in --mix-two-client-obs mode.")
+    ap.add_argument("--state-role", type=str, default="state",
+                    help="Role value whose obs supplies proprio state in --mix-two-client-obs mode.")
+    ap.add_argument("--color-match", type=str, default="off",
+                    choices=list(_COLOR_MATCH_MODES),
+                    help="Color-match raw camera frames to the training distribution before inference. "
+                         "'fixed' applies a constant real->train transform (temporally stable, "
+                         "recommended for real-robot deploy); 'adaptive' normalizes each frame's own "
+                         "stats; 'off' (default) leaves frames untouched -- keep it off when replaying "
+                         "dataset frames through this server.")
+    ap.add_argument("--color-match-strength", type=float, default=1.0,
+                    help="Blend strength for --color-match in [0, 1]. 0 leaves raw frames unchanged; "
+                         "1 applies the full color match; values like 0.8 reduce over-saturation.")
     args = ap.parse_args()
 
     _configure_logging(args.log_file)
@@ -906,9 +1112,18 @@ def main() -> None:
         warmup=not args.no_warmup,
         save_client_frame_dir=args.save_client_frame_dir,
         log_state_action_csv=args.log_state_action_csv,
+        color_match=args.color_match,
+        color_match_strength=args.color_match_strength,
     )
 
-    FastWAMPolicyServer(adapter, host=args.host, port=args.port).serve_forever()
+    FastWAMPolicyServer(
+        adapter,
+        host=args.host,
+        port=args.port,
+        mix_two_client_obs=args.mix_two_client_obs,
+        image_role=args.image_role,
+        state_role=args.state_role,
+    ).serve_forever()
 
 
 if __name__ == "__main__":

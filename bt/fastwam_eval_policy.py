@@ -38,6 +38,7 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fastwam.utils.config_resolvers import register_default_resolvers  # noqa: E402
+
+
+_SAVED_EVAL_INPUT_IMAGE_DIRS: set[Path] = set()
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -162,6 +166,54 @@ def _repeat_or_trim_state(proprio: torch.Tensor, horizon: int) -> torch.Tensor:
     return torch.cat([state, pad], dim=1)
 
 
+def _normalized_image_to_hwc_uint8(image: torch.Tensor) -> np.ndarray:
+    t = image.detach().to(device="cpu", dtype=torch.float32)
+    if t.ndim == 4:
+        t = t[0]
+    if t.ndim != 3 or t.shape[0] != 3:
+        raise ValueError(f"Expected image tensor [3,H,W] or [1,3,H,W], got {tuple(t.shape)}")
+    if float(t.min()) < 0.0:
+        t = t * 0.5 + 0.5
+    elif float(t.max()) > 1.5:
+        t = t / 255.0
+    t = t.clamp(0, 1)
+    return (t.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+
+
+def save_eval_input_images_once(
+    output_dir: str | Path,
+    sample_video: torch.Tensor,
+    model_input: torch.Tensor,
+    *,
+    pre_resize_video: torch.Tensor | None = None,
+) -> Path | None:
+    out = Path(output_dir).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    key = out.resolve()
+    if key in _SAVED_EVAL_INPUT_IMAGE_DIRS:
+        return None
+
+    if sample_video.ndim == 4:
+        sample_image = sample_video[:, 0]
+    else:
+        sample_image = sample_video
+    if pre_resize_video is not None:
+        camera_names = ("head_rgb", "left_wrist_rgb", "right_wrist_rgb")
+        if pre_resize_video.ndim != 5:
+            raise ValueError(
+                f"Expected pre_resize_video [num_cameras,T,C,H,W], got {tuple(pre_resize_video.shape)}"
+            )
+        for cam_idx in range(int(pre_resize_video.shape[0])):
+            name = camera_names[cam_idx] if cam_idx < len(camera_names) else f"camera_{cam_idx}"
+            Image.fromarray(_normalized_image_to_hwc_uint8(pre_resize_video[cam_idx, 0])).save(
+                out / f"pre_resize_{name}.png"
+            )
+    Image.fromarray(_normalized_image_to_hwc_uint8(sample_image)).save(out / "input_image.png")
+    Image.fromarray(_normalized_image_to_hwc_uint8(model_input)).save(out / "model_input.png")
+    _SAVED_EVAL_INPUT_IMAGE_DIRS.add(key)
+    return out
+
+
 def denormalize_merged_action(processor, action: torch.Tensor, proprio: torch.Tensor) -> np.ndarray:
     """Undo FastWAM processor normalization and return merged flat actions."""
     action_btd = _to_batched_action(action)
@@ -244,6 +296,7 @@ def collect_fastwam_openloop(
     tiled: bool,
     plot_state: bool,
     mse_drop_dims: list[int] | None,
+    save_input_image_dir: str | Path | None,
 ) -> dict[str, Any]:
     start, end = _episode_span(dataset, episode_index)
     ep_len = end - start
@@ -261,6 +314,15 @@ def collect_fastwam_openloop(
         if not isinstance(video, torch.Tensor) or video.ndim != 4:
             raise ValueError(f"Expected sample['video'] [C,T,H,W], got {type(video)} {getattr(video, 'shape', None)}")
         input_image = video[:, 0].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+        if save_input_image_dir is not None:
+            saved_dir = save_eval_input_images_once(
+                save_input_image_dir,
+                video,
+                input_image,
+                pre_resize_video=sample.get("pre_resize_video"),
+            )
+            if saved_dir is not None:
+                print(f"Saved eval input images to {saved_dir.resolve()}")
         proprio = sample["proprio"]
         proprio0 = proprio[0].to(device=model.device, dtype=model.torch_dtype)
 
@@ -515,8 +577,8 @@ def save_fastwam_openloop_csv(
 
 
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
-    if not args.save_plot and not args.show and not args.save_csv:
-        raise SystemExit("Pass --save-plot PATH, --save-csv PATH, and/or --show.")
+    if not args.save_plot and not args.show and not args.save_csv and not args.save_input_image_dir:
+        raise SystemExit("Pass --save-plot PATH, --save-csv PATH, --save-input-image-dir DIR, and/or --show.")
 
     checkpoints = _expand_checkpoints(args.checkpoint)
     cfg = _compose_cfg(args.task, args.config_override)
@@ -563,6 +625,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             tiled=bool(args.tiled),
             plot_state=bool(args.plot_state),
             mse_drop_dims=list(args.mse_drop_dims) if args.mse_drop_dims else None,
+            save_input_image_dir=args.save_input_image_dir,
         )
 
         plot_path = _default_plot_path(args.save_plot, checkpoint, multi_ckpt=len(checkpoints) > 1)
@@ -596,6 +659,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "mae": info["mae"],
             "plot": plot_path,
             "csv": csv_path,
+            "input_images": args.save_input_image_dir,
         }
         print(json.dumps(summary, indent=2))
         results.append(summary)
@@ -644,6 +708,12 @@ def _parse_cli() -> argparse.Namespace:
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-csv", type=str, default=None, help="Write per-step GT/pred action values to CSV.")
+    parser.add_argument(
+        "--save-input-image-dir",
+        type=str,
+        default=None,
+        help="Save the first eval sample image and actual model input PNGs to this directory.",
+    )
     parser.add_argument("--plot-state", action="store_true")
     parser.add_argument("--no-unify-y-scale", action="store_true")
     parser.add_argument("--y-margin-frac", type=float, default=0.05)
